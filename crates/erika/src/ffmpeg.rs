@@ -514,7 +514,12 @@ pub enum DecoderOutput {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecoderBackend {
     Software,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     VideoToolbox,
+    #[cfg(target_os = "windows")]
+    D3d11va,
+    #[cfg(target_os = "windows")]
+    Dxva2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -529,9 +534,24 @@ impl DecoderConfig {
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn videotoolbox() -> Self {
         Self {
             backend: DecoderBackend::VideoToolbox,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn d3d11va() -> Self {
+        Self {
+            backend: DecoderBackend::D3d11va,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn dxva2() -> Self {
+        Self {
+            backend: DecoderBackend::Dxva2,
         }
     }
 }
@@ -593,8 +613,20 @@ impl Decoder {
             "avcodec_parameters_to_context",
         )?;
         let mut decoder = decoder;
-        if config.backend == DecoderBackend::VideoToolbox {
-            decoder.configure_videotoolbox(codec)?;
+        match config.backend {
+            DecoderBackend::Software => {}
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            DecoderBackend::VideoToolbox => {
+                decoder.configure_videotoolbox(codec)?;
+            }
+            #[cfg(target_os = "windows")]
+            DecoderBackend::D3d11va => {
+                decoder.configure_hw_accel(codec, sys::AVHWDeviceType_AV_HWDEVICE_TYPE_D3D11VA, "D3D11VA")?;
+            }
+            #[cfg(target_os = "windows")]
+            DecoderBackend::Dxva2 => {
+                decoder.configure_hw_accel(codec, sys::AVHWDeviceType_AV_HWDEVICE_TYPE_DXVA2, "DXVA2")?;
+            }
         }
         check(
             unsafe { sys::avcodec_open2(decoder.context, codec, ptr::null_mut()) },
@@ -652,27 +684,30 @@ impl Decoder {
         unsafe { sys::avcodec_flush_buffers(self.context) };
     }
 
-    fn configure_videotoolbox(&mut self, codec: *const sys::AVCodec) -> Result<()> {
+    fn configure_hw_accel(
+        &mut self,
+        codec: *const sys::AVCodec,
+        device_type: sys::AVHWDeviceType,
+        label: &'static str,
+    ) -> Result<()> {
         let pixel_format =
-            hardware_pixel_format(codec, sys::AVHWDeviceType_AV_HWDEVICE_TYPE_VIDEOTOOLBOX)
-                .ok_or_else(|| FfmpegError::NullPointer("avcodec_get_hw_config(VideoToolbox)"))?;
+            hardware_pixel_format(codec, device_type)
+                .ok_or_else(|| FfmpegError::NullPointer(label))?;
         let mut device_ref = ptr::null_mut();
         check(
             unsafe {
                 sys::av_hwdevice_ctx_create(
                     &mut device_ref,
-                    sys::AVHWDeviceType_AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+                    device_type,
                     ptr::null(),
                     ptr::null_mut(),
                     0,
                 )
             },
-            "av_hwdevice_ctx_create(VideoToolbox)",
+            label,
         )?;
         if device_ref.is_null() {
-            return Err(FfmpegError::NullPointer(
-                "av_hwdevice_ctx_create(VideoToolbox)",
-            ));
+            return Err(FfmpegError::NullPointer(label));
         }
 
         let context_device_ref = unsafe { sys::av_buffer_ref(device_ref) };
@@ -693,6 +728,11 @@ impl Decoder {
         }
         self.hw_state = Some(hw_state);
         Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn configure_videotoolbox(&mut self, codec: *const sys::AVCodec) -> Result<()> {
+        self.configure_hw_accel(codec, sys::AVHWDeviceType_AV_HWDEVICE_TYPE_VIDEOTOOLBOX, "VideoToolbox")
     }
 }
 
@@ -722,6 +762,7 @@ pub struct AudioResampler {
 
 unsafe impl Send for AudioResampler {}
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoToolboxPixelBuffer<'a> {
     raw: *mut c_void,
@@ -730,6 +771,7 @@ pub struct VideoToolboxPixelBuffer<'a> {
     _frame: PhantomData<&'a Frame>,
 }
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 impl VideoToolboxPixelBuffer<'_> {
     pub fn raw(self) -> *mut c_void {
         self.raw
@@ -799,14 +841,21 @@ impl Frame {
         unsafe { (*self.ptr).format }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn is_videotoolbox(&self) -> bool {
         self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn is_d3d11va(&self) -> bool {
+        self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD
     }
 
     pub fn has_hw_frames_context(&self) -> bool {
         unsafe { !(*self.ptr).hw_frames_ctx.is_null() }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn videotoolbox_pixel_buffer(&self) -> Option<VideoToolboxPixelBuffer<'_>> {
         if !self.is_videotoolbox() {
             return None;
@@ -1960,7 +2009,7 @@ unsafe fn profile_name(
 ) -> Option<String> {
     let codec_id = unsafe { (*codecpar).codec_id };
     let profile = unsafe { (*codecpar).profile };
-    if profile == sys::FF_PROFILE_UNKNOWN {
+    if profile == sys::AV_PROFILE_UNKNOWN {
         return None;
     }
     let name = unsafe { sys::av_get_profile_name(sys::avcodec_find_decoder(codec_id), profile) };

@@ -6,7 +6,7 @@ use crate::core::{
     RendererBackend, RendererRuntimeStats, Result, TransferFunction, WgpuSurfaceHandle,
     WgpuSurfaceKind,
 };
-use crate::danmaku::{DanmakuGlyphAtlas, DanmakuGlyphInstance, DanmakuRenderPlan};
+use crate::danmaku::{DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
@@ -103,6 +103,8 @@ pub struct VideoUniforms {
     pub edr_output: u32,
     pub reserved0: u32,
     pub reserved1: u32,
+    pub rect: [f32; 4],
+    pub viewport: [f32; 4],
     pub nits: [f32; 4],
     pub luma_coefficients: [f32; 4],
     pub gamut_matrix_rows: [[f32; 4]; 3],
@@ -122,6 +124,8 @@ impl VideoUniforms {
             edr_output: u32::from(edr_output),
             reserved0: 0,
             reserved1: 0,
+            rect: [0.0, 0.0, 0.0, 0.0],
+            viewport: [0.0, 0.0, 0.0, 0.0],
             nits: [
                 pipeline.source.nominal_peak_nits,
                 pipeline.target.peak_nits,
@@ -143,6 +147,41 @@ fn transfer_code(transfer: TransferFunction) -> u32 {
         TransferFunction::Pq => 3,
         TransferFunction::Hlg => 4,
         TransferFunction::Unknown => 1,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VideoPresentationLayout {
+    target_rect: [f32; 4],
+    drawable_width: f32,
+    drawable_height: f32,
+}
+
+impl VideoPresentationLayout {
+    fn aspect_fit(
+        source_width: u32,
+        source_height: u32,
+        drawable_width: u32,
+        drawable_height: u32,
+    ) -> Self {
+        let source_width = source_width.max(1) as f32;
+        let source_height = source_height.max(1) as f32;
+        let drawable_width = drawable_width.max(1) as f32;
+        let drawable_height = drawable_height.max(1) as f32;
+        let scale = (drawable_width / source_width).min(drawable_height / source_height);
+        let width = source_width * scale;
+        let height = source_height * scale;
+        let x = (drawable_width - width) * 0.5;
+        let y = (drawable_height - height) * 0.5;
+        Self {
+            target_rect: [x, y, width, height],
+            drawable_width,
+            drawable_height,
+        }
+    }
+
+    fn video_viewport(self) -> [f32; 4] {
+        [self.drawable_width, self.drawable_height, 0.0, 0.0]
     }
 }
 
@@ -233,6 +272,7 @@ impl OverlayUniforms {
         }
     }
 
+    #[allow(dead_code)]
     fn alpha_atlas_rect(
         color: [f32; 4],
         rect: [f32; 4],
@@ -295,6 +335,31 @@ impl WgpuDanmakuAtlasCache {
     }
 }
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct DanmakuBatchInstance {
+    rect: [f32; 4],
+    tex_rect: [f32; 4],
+    color: [f32; 4],
+}
+
+impl DanmakuBatchInstance {
+    fn new(rect: [f32; 4], tex_rect: [f32; 4], color: [f32; 4]) -> Self {
+        Self {
+            rect,
+            tex_rect,
+            color,
+        }
+    }
+}
+
+struct DanmakuBatchPipeline {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    format: wgpu::TextureFormat,
+}
+
 /// The currently uploaded video frame: GPU plane textures plus the color uniforms
 /// to render it. Retained so the presenter can re-present it across vsync ticks.
 struct UploadedVideoFrame {
@@ -319,8 +384,11 @@ pub struct WgpuRenderer {
     surface: Option<AttachedSurface>,
     video_pipeline: Option<VideoPipeline>,
     overlay_pipeline: Option<OverlayPipeline>,
+    danmaku_batch_pipeline: Option<DanmakuBatchPipeline>,
     current_video: Option<UploadedVideoFrame>,
     danmaku_atlas_cache: Option<WgpuDanmakuAtlasCache>,
+    danmaku_instance_buffer: Option<wgpu::Buffer>,
+    danmaku_instance_buffer_len: usize,
     supports_16bit_norm: bool,
     stats: WgpuRendererStats,
 }
@@ -371,6 +439,9 @@ impl WgpuRenderer {
             overlay_pipeline: None,
             current_video: None,
             danmaku_atlas_cache: None,
+            danmaku_batch_pipeline: None,
+            danmaku_instance_buffer: None,
+            danmaku_instance_buffer_len: 0,
             supports_16bit_norm,
             stats: WgpuRendererStats::default(),
         })
@@ -707,10 +778,7 @@ impl WgpuRenderer {
             Some(frame) if overlay_has_planes(frame) => self.prepare_overlay_draws(frame)?,
             _ => Vec::new(),
         };
-        let danmaku_draws = match danmaku {
-            Some(plan) if !plan.is_empty() => self.prepare_danmaku_draws(plan)?,
-            _ => Vec::new(),
-        };
+        let danmaku_plan = danmaku.filter(|plan| !plan.is_empty());
         let video = self
             .current_video
             .as_ref()
@@ -726,11 +794,25 @@ impl WgpuRenderer {
         let chroma_view = video
             .chroma
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let surface_width = self.stats.surface_width.max(1);
+        let surface_height = self.stats.surface_height.max(1);
+        let layout = VideoPresentationLayout::aspect_fit(
+            video.width,
+            video.height,
+            surface_width,
+            surface_height,
+        );
+
+        let mut uniforms = video.uniforms;
+        uniforms.rect = layout.target_rect;
+        uniforms.viewport = layout.video_viewport();
+
         let uniform_buffer = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("erika-wgpu-video-uniforms"),
-                contents: bytemuck::bytes_of(&video.uniforms),
+                contents: bytemuck::bytes_of(&uniforms),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -780,13 +862,13 @@ impl WgpuRenderer {
             });
             pass.set_pipeline(&pipeline.pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.draw(0..3, 0..1);
+            pass.draw(0..6, 0..1);
         }
 
-        if !overlay_draws.is_empty() || !danmaku_draws.is_empty() {
-            let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
-                PlayerError::Renderer("overlay pipeline not initialized".to_string())
-            })?;
+        let has_overlay = !overlay_draws.is_empty();
+        let has_danmaku = danmaku_plan.is_some();
+
+        if has_overlay || has_danmaku {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("erika-wgpu-overlay-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -794,7 +876,6 @@ impl WgpuRenderer {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Load to preserve the video plane, then alpha-blend overlays.
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
@@ -804,19 +885,178 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&overlay_pipeline.pipeline);
-            for draw in &overlay_draws {
-                pass.set_bind_group(0, &draw.bind_group, &[]);
-                pass.draw(0..4, 0..1);
+
+            if has_overlay {
+                let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
+                    PlayerError::Renderer("overlay pipeline not initialized".to_string())
+                })?;
+                pass.set_pipeline(&overlay_pipeline.pipeline);
+                for draw in &overlay_draws {
+                    pass.set_bind_group(0, &draw.bind_group, &[]);
+                    pass.draw(0..6, 0..1);
+                }
             }
-            for draw in &danmaku_draws {
-                pass.set_bind_group(0, &draw.bind_group, &[]);
-                pass.draw(0..4, 0..1);
+
+            if let Some(plan) = danmaku_plan {
+                let _ = self.draw_danmaku_batch(&mut pass, plan)?;
             }
         }
 
         self.queue.submit(Some(encoder.finish()));
-        Ok(danmaku_draws.len())
+        Ok(0)
+    }
+
+    fn draw_danmaku_batch(
+        &mut self,
+        pass: &mut wgpu::RenderPass<'_>,
+        plan: &DanmakuRenderPlan,
+    ) -> Result<usize> {
+        let Some(atlas) = plan.atlas.as_ref() else {
+            return Ok(0);
+        };
+        if !atlas.is_valid() {
+            return Ok(0);
+        }
+
+        self.ensure_danmaku_batch_pipeline(self.surface.as_ref().unwrap().config.format);
+
+        let viewport_w = plan.viewport.width;
+        let viewport_h = plan.viewport.height;
+
+        let (fill_texture, outline_texture) = self.prepare_danmaku_atlas_textures(atlas);
+
+        let mut shadow_instances = Vec::new();
+        let mut outline_instances = Vec::new();
+        let mut fill_instances = Vec::new();
+
+        for item in &plan.items {
+            if item.shadow_rgba[3] > 0.0 {
+                let mut rect = item.rect;
+                rect[0] += item.shadow_offset[0];
+                rect[1] += item.shadow_offset[1];
+                shadow_instances.push(DanmakuBatchInstance::new(
+                    rect,
+                    item.tex_rect,
+                    item.shadow_rgba,
+                ));
+            }
+            if item.outline_rgba[3] > 0.0 {
+                outline_instances.push(DanmakuBatchInstance::new(
+                    item.rect,
+                    item.tex_rect,
+                    item.outline_rgba,
+                ));
+            }
+            fill_instances.push(DanmakuBatchInstance::new(
+                item.rect,
+                item.tex_rect,
+                item.color_rgba,
+            ));
+        }
+
+        let outline_count = shadow_instances.len() + outline_instances.len();
+        let fill_count = fill_instances.len();
+        let total_count = outline_count + fill_count;
+
+        if total_count == 0 {
+            return Ok(0);
+        }
+
+        let mut outline_data = Vec::with_capacity(outline_count);
+        outline_data.extend_from_slice(&shadow_instances);
+        outline_data.extend_from_slice(&outline_instances);
+
+        let fill_data: Vec<DanmakuBatchInstance> = fill_instances;
+
+        let outline_bytes = bytemuck::cast_slice(&outline_data);
+        let fill_bytes = bytemuck::cast_slice(&fill_data);
+
+        self.ensure_danmaku_instance_buffer(outline_bytes.len().max(fill_bytes.len()));
+
+        let instance_buffer = self.danmaku_instance_buffer.as_ref().unwrap();
+
+        let batch_pipeline = self.danmaku_batch_pipeline.as_ref().ok_or_else(|| {
+            PlayerError::Renderer("danmaku batch pipeline not initialized".to_string())
+        })?;
+
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+        struct DanmakuBatchUniforms {
+            viewport: [f32; 2],
+        }
+
+        let batch_uniforms = DanmakuBatchUniforms {
+            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+        };
+        let uniform_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("erika-wgpu-danmaku-batch-uniforms"),
+                contents: bytemuck::bytes_of(&batch_uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+
+        pass.set_pipeline(&batch_pipeline.pipeline);
+
+        if outline_count > 0 {
+            self.queue.write_buffer(instance_buffer, 0, outline_bytes);
+            let outline_view = outline_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let outline_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("erika-wgpu-danmaku-outline-bgl"),
+                layout: &batch_pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: instance_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&outline_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&batch_pipeline.sampler),
+                    },
+                ],
+            });
+            pass.set_bind_group(0, &outline_bind_group, &[]);
+            pass.draw(0..6, 0..outline_count as u32);
+        }
+
+        if fill_count > 0 {
+            self.queue.write_buffer(instance_buffer, 0, fill_bytes);
+            let fill_view = fill_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let fill_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("erika-wgpu-danmaku-fill-bgl"),
+                layout: &batch_pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: instance_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&fill_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&batch_pipeline.sampler),
+                    },
+                ],
+            });
+            pass.set_bind_group(0, &fill_bind_group, &[]);
+            pass.draw(0..6, 0..fill_count as u32);
+        }
+
+        Ok(plan.items.len())
     }
 
     /// Build per-quad GPU resources for the overlay: straight-RGBA subtitle planes
@@ -867,42 +1107,6 @@ impl WgpuRenderer {
         Ok(draws)
     }
 
-    fn prepare_danmaku_draws(&mut self, plan: &DanmakuRenderPlan) -> Result<Vec<OverlayDraw>> {
-        if self.overlay_pipeline.is_none() {
-            return Err(PlayerError::Renderer(
-                "overlay pipeline not initialized".to_string(),
-            ));
-        }
-        let Some(atlas) = plan.atlas.as_ref() else {
-            return Ok(Vec::new());
-        };
-        if !atlas.is_valid() {
-            return Err(PlayerError::Renderer(format!(
-                "danmaku glyph atlas has fill={} outline={} bytes, expected at least {} for {}x{} stride {}",
-                atlas.fill_alpha.len(),
-                atlas.outline_alpha.len(),
-                atlas.required_len(),
-                atlas.width,
-                atlas.height,
-                atlas.stride
-            )));
-        }
-        let viewport_w = plan.viewport.width;
-        let viewport_h = plan.viewport.height;
-        let mut draws = Vec::with_capacity(plan.items.len() * 3);
-        let (fill_texture, outline_texture) = self.prepare_danmaku_atlas_textures(atlas);
-        for item in &plan.items {
-            self.append_danmaku_glyph_draws(
-                item,
-                &fill_texture,
-                &outline_texture,
-                viewport_w,
-                viewport_h,
-                &mut draws,
-            );
-        }
-        Ok(draws)
-    }
 
     fn prepare_danmaku_atlas_textures(
         &mut self,
@@ -940,47 +1144,6 @@ impl WgpuRenderer {
         (fill_texture, outline_texture)
     }
 
-    fn append_danmaku_glyph_draws(
-        &self,
-        item: &DanmakuGlyphInstance,
-        fill_texture: &wgpu::Texture,
-        outline_texture: &wgpu::Texture,
-        viewport_w: u32,
-        viewport_h: u32,
-        draws: &mut Vec<OverlayDraw>,
-    ) {
-        if item.shadow_rgba[3] > 0.0 {
-            let mut rect = item.rect;
-            rect[0] += item.shadow_offset[0];
-            rect[1] += item.shadow_offset[1];
-            let uniforms = OverlayUniforms::alpha_atlas_rect(
-                item.shadow_rgba,
-                rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-            );
-            draws.push(self.make_overlay_draw(outline_texture, uniforms));
-        }
-        if item.outline_rgba[3] > 0.0 {
-            let uniforms = OverlayUniforms::alpha_atlas_rect(
-                item.outline_rgba,
-                item.rect,
-                item.tex_rect,
-                viewport_w,
-                viewport_h,
-            );
-            draws.push(self.make_overlay_draw(outline_texture, uniforms));
-        }
-        let uniforms = OverlayUniforms::alpha_atlas_rect(
-            item.color_rgba,
-            item.rect,
-            item.tex_rect,
-            viewport_w,
-            viewport_h,
-        );
-        draws.push(self.make_overlay_draw(fill_texture, uniforms));
-    }
 
     /// Pack libass alpha coverage bitmaps horizontally into one R8 atlas and add a
     /// mode-1 (coverage tinted by the bitmap's color) draw per placement. Mirrors the
@@ -1181,7 +1344,7 @@ impl WgpuRenderer {
                     entries: &[
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
@@ -1365,6 +1528,145 @@ impl WgpuRenderer {
         });
     }
 
+    fn ensure_danmaku_batch_pipeline(&mut self, format: wgpu::TextureFormat) {
+        if self
+            .danmaku_batch_pipeline
+            .as_ref()
+            .is_some_and(|p| p.format == format)
+        {
+            return;
+        }
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("erika-wgpu-danmaku-batch-shader"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("wgpu_danmaku_batch.wgsl").into()),
+            });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("erika-wgpu-danmaku-batch-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("erika-wgpu-danmaku-batch-layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("erika-wgpu-danmaku-batch-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("erika_danmaku_batch_vertex"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("erika_danmaku_batch_fragment"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::SrcAlpha,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            });
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("erika-wgpu-danmaku-batch-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+        self.danmaku_batch_pipeline = Some(DanmakuBatchPipeline {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            format,
+        });
+    }
+
+    fn ensure_danmaku_instance_buffer(&mut self, required_len: usize) {
+        if required_len == 0 {
+            return;
+        }
+        if self.danmaku_instance_buffer_len >= required_len && self.danmaku_instance_buffer.is_some()
+        {
+            return;
+        }
+        let len = required_len.next_power_of_two().max(4096);
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("erika-wgpu-danmaku-instance-buffer"),
+            size: len as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.danmaku_instance_buffer = Some(buffer);
+        self.danmaku_instance_buffer_len = len;
+    }
+
     fn render_surface_clear(&mut self, color: WgpuClearColor) -> Result<()> {
         let Some(attached) = self.surface.as_ref() else {
             return Err(PlayerError::Renderer(
@@ -1374,6 +1676,10 @@ impl WgpuRenderer {
         let frame = match attached.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.configure_surface(attached.config.width, attached.config.height);
+                return Ok(());
+            }
             other => {
                 return Err(PlayerError::Renderer(format!(
                     "wgpu surface acquire failed: {other:?}"
@@ -1447,7 +1753,41 @@ impl RendererBackend for WgpuRenderer {
         // for the lifetime of the attachment, mirroring the Metal renderer contract.
         let target = match handle.kind {
             WgpuSurfaceKind::MacOsCaMetalLayer => {
-                wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(handle.raw_window as *mut c_void)
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                {
+                    wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(handle.raw_window as *mut c_void)
+                }
+                #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                {
+                    return Err(PlayerError::Renderer(
+                        "CoreAnimationLayer surface is only available on Apple platforms"
+                            .to_string(),
+                    ));
+                }
+            }
+            WgpuSurfaceKind::WindowsHwnd => {
+                use std::num::NonZeroIsize;
+
+                let hwnd = handle.raw_window as *mut c_void;
+                if hwnd.is_null() {
+                    return Err(PlayerError::Renderer(
+                        "invalid hwnd: null pointer".to_string(),
+                    ));
+                }
+                let hwnd_nonzero = match NonZeroIsize::new(hwnd as isize) {
+                    Some(nz) => nz,
+                    None => {
+                        return Err(PlayerError::Renderer(
+                            "invalid hwnd: zero value".to_string(),
+                        ));
+                    }
+                };
+                let raw_window = raw_window_handle::Win32WindowHandle::new(hwnd_nonzero);
+                let raw_display = raw_window_handle::WindowsDisplayHandle::new();
+                wgpu::SurfaceTargetUnsafe::RawHandle {
+                    raw_display_handle: Some(raw_display.into()),
+                    raw_window_handle: raw_window.into(),
+                }
             }
             other => {
                 return Err(PlayerError::Renderer(format!(
@@ -1459,7 +1799,55 @@ impl RendererBackend for WgpuRenderer {
             PlayerError::Renderer(format!("wgpu surface creation failed: {error}"))
         })?;
 
-        let caps = surface.get_capabilities(&self.adapter);
+        let mut caps = surface.get_capabilities(&self.adapter);
+        if caps.formats.is_empty() {
+            let compatible_adapter = pollster::block_on(
+                self.instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: Some(&surface),
+                }),
+            )
+            .map_err(|error| {
+                PlayerError::Renderer(format!(
+                    "wgpu adapter has no compatible formats and fallback adapter request failed: {error}"
+                ))
+            })?;
+            self.adapter = compatible_adapter;
+            let supports_16bit_norm = self
+                .adapter
+                .features()
+                .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
+            let required_features = if supports_16bit_norm {
+                wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            } else {
+                wgpu::Features::empty()
+            };
+            let (device, queue) =
+                pollster::block_on(self.adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("erika-wgpu-device"),
+                    required_features,
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    experimental_features: wgpu::ExperimentalFeatures::default(),
+                    trace: wgpu::Trace::Off,
+                }))
+                .map_err(|error| {
+                    PlayerError::Renderer(format!(
+                        "wgpu device request for compatible adapter failed: {error}"
+                    ))
+                })?;
+            self.device = device;
+            self.queue = queue;
+            self.supports_16bit_norm = supports_16bit_norm;
+            caps = surface.get_capabilities(&self.adapter);
+            if caps.formats.is_empty() {
+                return Err(PlayerError::Renderer(
+                    "wgpu surface reports no supported formats even with compatible adapter"
+                        .to_string(),
+                ));
+            }
+        }
         // Prefer a non-sRGB format: the video shader already emits display-encoded
         // values for the SDR target, so an sRGB surface would double-encode gamma.
         let format = caps
@@ -1528,29 +1916,38 @@ impl RendererBackend for WgpuRenderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
-        // Software path: repack the decoded planes (8-bit NV12 or 10-bit P010) and
-        // upload. A hardware frame (e.g. VideoToolbox) has no CPU planes here; that
-        // needs the per-platform zero-copy interop bridge (a later slice).
-        let planar = frame.frame.to_planar_frame().ok_or_else(|| {
+
+        let sw_frame;
+        let frame_ref = if frame.frame.has_hw_frames_context() {
+            sw_frame = frame
+                .frame
+                .transfer_to_system_memory()
+                .map_err(|e| PlayerError::Renderer(format!("hwframe transfer failed: {e}")))?;
+            &sw_frame
+        } else {
+            &frame.frame
+        };
+
+        let planar = frame_ref.to_planar_frame().ok_or_else(|| {
             PlayerError::Renderer(
-                "wgpu: frame is not software 4:2:0 8-bit/10-bit (hardware frame or unsupported \
-                 format)"
+                "wgpu: frame is not software 4:2:0 8-bit/10-bit (unsupported format)"
                     .to_string(),
             )
         })?;
         let is_p010 = matches!(planar.format, PlanarPixelFormat::P010);
         let source = SourceColorState::new(
-            frame.frame.color_primaries(),
-            frame.frame.transfer_function(),
+            frame_ref.color_primaries(),
+            frame_ref.transfer_function(),
         )
-        .range(frame.frame.color_range())
-        .matrix(frame.frame.matrix_coefficients())
-        .hdr_metadata(frame.frame.hdr_metadata());
+        .range(frame_ref.color_range())
+        .matrix(frame_ref.matrix_coefficients())
+        .hdr_metadata(frame_ref.hdr_metadata());
         let pipeline =
             VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
         let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
         self.upload_planar_with_context(planar, uniforms)
     }
+
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         if self.current_video.is_none() {
@@ -1577,6 +1974,10 @@ impl RendererBackend for WgpuRenderer {
         let frame = match attached.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture)
             | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.configure_surface(attached.config.width, attached.config.height);
+                return Ok(false);
+            }
             other => {
                 return Err(PlayerError::Renderer(format!(
                     "wgpu surface acquire failed: {other:?}"

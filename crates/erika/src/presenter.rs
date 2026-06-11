@@ -12,7 +12,7 @@ use crossbeam_channel::Receiver;
 use crate::apple::coreaudio::{CoreAudioOutput, CoreAudioOutputConfig};
 #[cfg(target_os = "ios")]
 use crate::apple::iosaudio::{IosAudioQueueOutput, IosAudioQueueOutputConfig};
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
 use crate::audio::BufferedAudioOutput;
 use crate::audio::{AudioClockSnapshot, AudioOutputBackend, AudioRingBufferConfig};
 use crate::core::{
@@ -26,7 +26,9 @@ use crate::danmaku::{
     DanmakuViewport, DfmLayoutEngine,
 };
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
+
 #[cfg(feature = "libass")]
 use crate::subtitle::decoded_subtitle_frames_to_ass_script;
 use crate::subtitle::{
@@ -46,7 +48,12 @@ const AUDIO_START_BUFFER: Duration = Duration::from_millis(50);
 pub struct PresenterConfig {
     pub player: PlayerConfig,
     pub audio: PresenterAudioConfig,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub renderer: MetalRendererConfig,
+    #[cfg(target_os = "windows")]
+    pub renderer: WgpuRendererConfig,
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
+    pub renderer: WgpuRendererConfig,
     pub overlay: OverlayTimeline,
     pub danmaku: Option<DanmakuTimeline>,
     pub danmaku_config: DanmakuLayoutConfig,
@@ -91,7 +98,7 @@ impl Default for PresenterConfig {
         Self {
             player: PlayerConfig::default(),
             audio: PresenterAudioConfig::default(),
-            renderer: MetalRendererConfig::default(),
+            renderer: Default::default(),
             overlay: OverlayTimeline::default(),
             danmaku: None,
             danmaku_config: DanmakuLayoutConfig::default(),
@@ -99,6 +106,10 @@ impl Default for PresenterConfig {
         }
     }
 }
+
+#[cfg(any(target_os = "windows", not(any(target_os = "macos", target_os = "ios"))))]
+#[derive(Debug, Clone, Default)]
+pub struct WgpuRendererConfig {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresenterStats {
@@ -1131,11 +1142,21 @@ impl Drop for PresenterRuntime {
 
 fn build_renderer(
     preference: RendererBackendPreference,
-    metal_config: MetalRendererConfig,
+    #[cfg(any(target_os = "macos", target_os = "ios"))] metal_config: MetalRendererConfig,
+    #[cfg(target_os = "windows")] _wgpu_config: WgpuRendererConfig,
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
+    _wgpu_config: WgpuRendererConfig,
 ) -> Result<Box<dyn RendererBackend>> {
     match preference {
         RendererBackendPreference::PlatformNative | RendererBackendPreference::Auto => {
-            Ok(Box::new(MetalRenderer::with_config(metal_config)?))
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                Ok(Box::new(MetalRenderer::with_config(metal_config)?))
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            {
+                build_wgpu_renderer()
+            }
         }
         RendererBackendPreference::WgpuFallback => build_wgpu_renderer(),
         RendererBackendPreference::FlutterTexture => Err(PlayerError::Renderer(
@@ -1157,7 +1178,15 @@ fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBacken
             ring_buffer: config.ring_buffer,
         }))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    #[cfg(target_os = "windows")]
+    {
+        Box::new(crate::audio::wasapi::WasapiAudioOutput::new(
+            crate::audio::wasapi::WasapiAudioConfig {
+                ring_buffer: config.ring_buffer,
+            },
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
     {
         Box::new(BufferedAudioOutput::new(config.ring_buffer))
     }

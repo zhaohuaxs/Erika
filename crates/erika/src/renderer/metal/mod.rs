@@ -6,6 +6,7 @@ use crate::core::{
     RendererBackend, RendererRuntimeStats, Result, TransferFunction,
 };
 use crate::danmaku::DanmakuRenderPlan;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::ffmpeg::Frame;
 use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
@@ -39,8 +40,11 @@ pub struct MetalRenderer {
     inner: apple::MetalRendererImpl,
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     _unsupported: (),
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     current_frame: Option<ImportedVideoFrame>,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     current_media_time: Duration,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     current_generation: u64,
 }
 
@@ -343,6 +347,7 @@ impl MetalRenderer {
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
+            let _ = config;
             Err(PlayerError::Renderer(
                 "Metal renderer is only available on Apple platforms for v0".to_string(),
             ))
@@ -472,6 +477,7 @@ impl MetalRenderer {
         Ok(info)
     }
 
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn import_player_frame(&mut self, frame: &Frame) -> Result<ImportedVideoFrame> {
         let pixel_buffer = frame.videotoolbox_pixel_buffer().ok_or_else(|| {
             PlayerError::Renderer(
@@ -616,30 +622,48 @@ impl RendererBackend for MetalRenderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
-        let imported = self.import_player_frame(&frame.frame)?;
-        self.current_frame = Some(imported);
-        self.current_media_time = frame.pts.unwrap_or(frame.media_time);
-        self.current_generation = frame.generation.max(1);
-        Ok(())
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let imported = self.import_player_frame(&frame.frame)?;
+            self.current_frame = Some(imported);
+            self.current_media_time = frame.pts.unwrap_or(frame.media_time);
+            self.current_generation = frame.generation.max(1);
+            Ok(())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = frame;
+            Err(PlayerError::Renderer(
+                "Metal renderer is only available on Apple platforms for v0".to_string(),
+            ))
+        }
     }
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
-        let Some(frame) = self.current_frame.take() else {
-            return Ok(false);
-        };
-        let danmaku = context.danmaku.filter(|plan| {
-            plan.generation == context.generation
-                && plan.media_time == context.media_time
-                && (context.output_width == 0 || plan.viewport.width == context.output_width)
-                && (context.output_height == 0 || plan.viewport.height == context.output_height)
-        });
-        let result = self.render_video_frame_with_context(
-            VideoRenderFrame::new(&frame),
-            context.overlay.map(OverlayRenderFrame::new),
-            danmaku.map(DanmakuRenderFrame::new),
-        );
-        self.current_frame = Some(frame);
-        result.map(|()| true)
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            let Some(frame) = self.current_frame.take() else {
+                return Ok(false);
+            };
+            let danmaku = context.danmaku.filter(|plan| {
+                plan.generation == context.generation
+                    && plan.media_time == context.media_time
+                    && (context.output_width == 0 || plan.viewport.width == context.output_width)
+                    && (context.output_height == 0 || plan.viewport.height == context.output_height)
+            });
+            let result = self.render_video_frame_with_context(
+                VideoRenderFrame::new(&frame),
+                context.overlay.map(OverlayRenderFrame::new),
+                danmaku.map(DanmakuRenderFrame::new),
+            );
+            self.current_frame = Some(frame);
+            result.map(|()| true)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            let _ = context;
+            Ok(false)
+        }
     }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {

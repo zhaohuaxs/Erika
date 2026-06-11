@@ -41,14 +41,20 @@ const EXTERNAL_SUBTITLE_LOOKAHEAD: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoDecodePreference {
     Software,
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     VideoToolbox,
+    #[cfg(target_os = "windows")]
+    D3d11va,
 }
 
 impl VideoDecodePreference {
     fn decoder_config(self) -> DecoderConfig {
         match self {
             Self::Software => DecoderConfig::software(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
             Self::VideoToolbox => DecoderConfig::videotoolbox(),
+            #[cfg(target_os = "windows")]
+            Self::D3d11va => DecoderConfig::d3d11va(),
         }
     }
 }
@@ -60,7 +66,14 @@ impl Default for VideoDecodePreference {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+#[cfg(target_os = "windows")]
+impl Default for VideoDecodePreference {
+    fn default() -> Self {
+        Self::D3d11va
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
 impl Default for VideoDecodePreference {
     fn default() -> Self {
         Self::Software

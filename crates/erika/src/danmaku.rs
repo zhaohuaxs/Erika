@@ -1465,7 +1465,14 @@ impl DanmakuTextRasterizer {
                         packed.height as f32 / atlas_h,
                     ],
                     color_rgba: color,
-                    outline_rgba: [0.0, 0.0, 0.0, color[3].min(0.75)],
+                    outline_rgba: {
+                        let lum = 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2];
+                        if lum < 0.5 {
+                            [1.0, 1.0, 1.0, color[3].min(0.75)]
+                        } else {
+                            [0.0, 0.0, 0.0, color[3].min(0.75)]
+                        }
+                    },
                     shadow_rgba: [0.0, 0.0, 0.0, (color[3] * item.shadow_alpha).min(1.0)],
                     shadow_offset: item.shadow_offset,
                 });

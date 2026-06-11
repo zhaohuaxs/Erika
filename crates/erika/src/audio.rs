@@ -439,6 +439,9 @@ fn offset_pts(pts: Duration, frames: usize, sample_rate: u32) -> Option<Duration
     Some(pts + Duration::from_secs_f64(frames as f64 / sample_rate as f64))
 }
 
+#[cfg(target_os = "windows")]
+pub mod wasapi;
+
 #[cfg(test)]
 mod tests {
     use super::*;

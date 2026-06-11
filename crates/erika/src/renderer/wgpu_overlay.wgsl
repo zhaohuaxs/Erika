@@ -1,7 +1,7 @@
 // WGSL port of the Metal overlay shader in `renderer/metal/apple.rs`. Draws a
 // textured quad placed by pixel rect within the viewport, alpha-blended over the
 // video plane. Mode 0 samples straight RGBA; mode 1 is an alpha mask tinted by
-// `color` (libass coverage bitmaps).
+// `color` (libass coverage bitmaps / danmaku glyph alpha masks).
 
 struct OverlayUniforms {
     rect: vec4<f32>,
@@ -23,17 +23,21 @@ struct VertexOut {
 
 @vertex
 fn erika_overlay_vertex(@builtin(vertex_index) vertex_id: u32) -> VertexOut {
-    var unit_positions = array<vec2<f32>, 4>(
+    var unit_positions = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
         vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
         vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 1.0),
     );
-    var tex_coords = array<vec2<f32>, 4>(
+    var tex_coords = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
         vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
         vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 1.0),
     );
 
     let pixel = uniforms.rect.xy + unit_positions[vertex_id] * uniforms.rect.zw;

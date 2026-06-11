@@ -365,6 +365,7 @@ dependencies = [
  "objc2-metal",
  "objc2-quartz-core",
  "pollster",
+ "raw-window-handle",
  "regex",
  "rustc-hash 2.1.2",
  "serde",
@@ -373,6 +374,7 @@ dependencies = [
  "thiserror",
  "ureq",
  "wgpu",
+ "windows",
 ]
 
 [[package]]
@@ -1885,6 +1887,14 @@ version = "0.0.1"
 dependencies = [
  "cc",
  "erika",
+]
+
+[[package]]
+name = "win_presenter_check"
+version = "0.0.1"
+dependencies = [
+ "erika",
+ "windows",
 ]
 
 [[package]]

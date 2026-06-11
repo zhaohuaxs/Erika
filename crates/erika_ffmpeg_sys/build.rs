@@ -21,13 +21,31 @@ fn main() {
     }
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=static=avdevice");
-    println!("cargo:rustc-link-lib=static=avfilter");
-    println!("cargo:rustc-link-lib=static=avformat");
-    println!("cargo:rustc-link-lib=static=avcodec");
-    println!("cargo:rustc-link-lib=static=swresample");
-    println!("cargo:rustc-link-lib=static=swscale");
-    println!("cargo:rustc-link-lib=static=avutil");
+
+    let link_static = env::var("ERIKA_FFMPEG_STATIC").as_deref() == Ok("1");
+    let link_prefix = if link_static { "static=" } else { "" };
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib={}avformat", link_prefix);
+        println!("cargo:rustc-link-lib={}avcodec", link_prefix);
+        println!("cargo:rustc-link-lib={}swresample", link_prefix);
+        println!("cargo:rustc-link-lib={}swscale", link_prefix);
+        println!("cargo:rustc-link-lib={}avutil", link_prefix);
+        if lib_dir.join("avdevice.lib").exists() {
+            println!("cargo:rustc-link-lib={}avdevice", link_prefix);
+        }
+        if lib_dir.join("avfilter.lib").exists() {
+            println!("cargo:rustc-link-lib={}avfilter", link_prefix);
+        }
+    } else {
+        println!("cargo:rustc-link-lib={}avdevice", link_prefix);
+        println!("cargo:rustc-link-lib={}avfilter", link_prefix);
+        println!("cargo:rustc-link-lib={}avformat", link_prefix);
+        println!("cargo:rustc-link-lib={}avcodec", link_prefix);
+        println!("cargo:rustc-link-lib={}swresample", link_prefix);
+        println!("cargo:rustc-link-lib={}swscale", link_prefix);
+        println!("cargo:rustc-link-lib={}avutil", link_prefix);
+    }
 
     if matches!(
         env::var("CARGO_CFG_TARGET_OS").as_deref(),
@@ -40,6 +58,23 @@ fn main() {
         println!("cargo:rustc-link-lib=iconv");
         println!("cargo:rustc-link-lib=bz2");
         println!("cargo:rustc-link-lib=z");
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=bcrypt");
+        println!("cargo:rustc-link-lib=secur32");
+        println!("cargo:rustc-link-lib=Mfplat");
+        println!("cargo:rustc-link-lib=wmcodecdspuuid");
+        println!("cargo:rustc-link-lib=strmiids");
+        println!("cargo:rustc-link-lib=ole32");
+        println!("cargo:rustc-link-lib=user32");
+        println!("cargo:rustc-link-lib=ws2_32");
+        println!("cargo:rustc-link-lib=secur32");
+        println!("cargo:rustc-link-lib=shlwapi");
+        println!("cargo:rustc-link-lib=shell32");
+        println!("cargo:rustc-link-lib=d3d11");
+        println!("cargo:rustc-link-lib=dxgi");
+        println!("cargo:rustc-link-lib=strmiids");
     }
 
     let bindings = bindgen::Builder::default()

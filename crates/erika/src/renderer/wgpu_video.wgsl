@@ -11,6 +11,8 @@ struct VideoUniforms {
     edr_output: u32,
     reserved0: u32,
     reserved1: u32,
+    rect: vec4<f32>,
+    viewport: vec4<f32>,
     nits: vec4<f32>,
     luma_coefficients: vec4<f32>,
     gamut_matrix_rows: array<vec4<f32>, 3>,
@@ -150,18 +152,29 @@ fn expand_ycbcr_range(y_in: f32, cbcr_in: vec2<f32>) -> RangeExpandedYCbCr {
 
 @vertex
 fn erika_video_vertex(@builtin(vertex_index) vertex_id: u32) -> VertexOut {
-    var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0),
-    );
-    var tex_coords = array<vec2<f32>, 3>(
+    var unit_positions = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 0.0),
         vec2<f32>(0.0, 1.0),
-        vec2<f32>(2.0, 1.0),
-        vec2<f32>(0.0, -1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+    );
+    var tex_coords = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+    );
+    let pixel = uniforms.rect.xy + unit_positions[vertex_id] * uniforms.rect.zw;
+    let ndc = vec2<f32>(
+        pixel.x / max(uniforms.viewport.x, 1.0) * 2.0 - 1.0,
+        1.0 - pixel.y / max(uniforms.viewport.y, 1.0) * 2.0,
     );
     var out: VertexOut;
-    out.position = vec4<f32>(positions[vertex_id], 0.0, 1.0);
+    out.position = vec4<f32>(ndc, 0.0, 1.0);
     out.tex_coord = tex_coords[vertex_id];
     return out;
 }

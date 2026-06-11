@@ -85,10 +85,14 @@ class _ErikaVideoViewState extends State<ErikaVideoView> {
           hitTestBehavior: PlatformViewHitTestBehavior.transparent,
           gestureRecognizers: const <Factory<OneSequenceGestureRecognizer>>{},
         );
+      case TargetPlatform.windows:
+        return _ErikaWindowsVideoView(
+          player: widget.player,
+          onPlatformViewIdChanged: widget.onPlatformViewIdChanged,
+        );
       case TargetPlatform.android:
       case TargetPlatform.fuchsia:
       case TargetPlatform.linux:
-      case TargetPlatform.windows:
         return const SizedBox.shrink();
     }
   }
@@ -188,7 +192,8 @@ class _ErikaWindowOverlayVideoViewState
     if (!mounted ||
         _isBound ||
         kIsWeb ||
-        defaultTargetPlatform != TargetPlatform.macOS) {
+        (defaultTargetPlatform != TargetPlatform.macOS &&
+            defaultTargetPlatform != TargetPlatform.windows)) {
       return;
     }
 
@@ -232,7 +237,9 @@ class _ErikaWindowOverlayVideoViewState
     required bool visible,
     bool force = false,
   }) async {
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
+    if (kIsWeb ||
+        (defaultTargetPlatform != TargetPlatform.macOS &&
+            defaultTargetPlatform != TargetPlatform.windows)) {
       return;
     }
 
@@ -295,10 +302,76 @@ class _ErikaWindowOverlayVideoViewState
 
   @override
   Widget build(BuildContext context) {
-    if (kIsWeb || defaultTargetPlatform != TargetPlatform.macOS) {
+    if (kIsWeb ||
+        (defaultTargetPlatform != TargetPlatform.macOS &&
+            defaultTargetPlatform != TargetPlatform.windows)) {
       return const SizedBox.shrink();
     }
     _scheduleFrameUpdate();
+    return const SizedBox.expand();
+  }
+}
+
+class _ErikaWindowsVideoView extends StatefulWidget {
+  const _ErikaWindowsVideoView({
+    required this.player,
+    this.onPlatformViewIdChanged,
+  });
+
+  final ErikaPlayer player;
+  final ValueChanged<int?>? onPlatformViewIdChanged;
+
+  @override
+  State<_ErikaWindowsVideoView> createState() => _ErikaWindowsVideoViewState();
+}
+
+class _ErikaWindowsVideoViewState extends State<_ErikaWindowsVideoView> {
+  int? _viewId;
+  bool _attached = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _attachSurface();
+  }
+
+  @override
+  void didUpdateWidget(covariant _ErikaWindowsVideoView oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.player != widget.player) {
+      _detachSurface();
+      _attachSurface();
+    }
+  }
+
+  @override
+  void dispose() {
+    _detachSurface();
+    super.dispose();
+  }
+
+  Future<void> _attachSurface() async {
+    if (_attached || !mounted) return;
+    try {
+      await widget.player.ensureCreated();
+      _attached = true;
+      await widget.player.attachView(ErikaPlayer.windowOverlayViewId);
+    } catch (error) {
+      debugPrint('ErikaWindowsVideoView: attach failed: $error');
+    }
+  }
+
+  Future<void> _detachSurface() async {
+    if (!_attached) return;
+    try {
+      await widget.player.detachView(ErikaPlayer.windowOverlayViewId);
+    } catch (_) {}
+    _attached = false;
+    widget.onPlatformViewIdChanged?.call(null);
+  }
+
+  @override
+  Widget build(BuildContext context) {
     return const SizedBox.expand();
   }
 }

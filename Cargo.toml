@@ -25,6 +25,7 @@ members = [
   "examples/wgpu_decode_png",
   "examples/wgpu_window_check",
   "examples/wgpu_overlay_png",
+  "examples/win_presenter_check",
   "xtask",
 ]
 resolver = "2"

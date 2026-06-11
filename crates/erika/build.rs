@@ -18,6 +18,11 @@ fn main() {
         return;
     }
 
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:warning=libass feature is not yet supported on Windows; skipping native dependency linking");
+        return;
+    }
+
     let libass = native_dep_dir("ERIKA_LIBASS_DIR", "libass");
     let freetype = native_dep_dir("ERIKA_FREETYPE_DIR", "freetype");
     let harfbuzz = native_dep_dir("ERIKA_HARFBUZZ_DIR", "harfbuzz");
