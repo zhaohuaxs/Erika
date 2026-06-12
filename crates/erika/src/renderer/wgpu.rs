@@ -363,8 +363,8 @@ struct DanmakuBatchPipeline {
 /// The currently uploaded video frame: GPU plane textures plus the color uniforms
 /// to render it. Retained so the presenter can re-present it across vsync ticks.
 struct UploadedVideoFrame {
-    luma: wgpu::Texture,
-    chroma: wgpu::Texture,
+    luma: wgpu::TextureView,
+    chroma: wgpu::TextureView,
     width: u32,
     height: u32,
     uniforms: VideoUniforms,
@@ -413,11 +413,22 @@ impl WgpuRenderer {
         let supports_16bit_norm = adapter
             .features()
             .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
-        let required_features = if supports_16bit_norm {
-            wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-        } else {
-            wgpu::Features::empty()
-        };
+        let supports_vulkan_ext_mem_win32 = adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32);
+        let supports_nv12 = adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_NV12);
+        let mut required_features = wgpu::Features::empty();
+        if supports_16bit_norm {
+            required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+        }
+        if supports_vulkan_ext_mem_win32 {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+        }
+        if supports_nv12 {
+            required_features |= wgpu::Features::TEXTURE_FORMAT_NV12;
+        }
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("erika-wgpu-device"),
@@ -712,9 +723,11 @@ impl WgpuRenderer {
             &frame.chroma,
             chroma_width * 2 * bytes_per_sample,
         );
+        let luma_view = luma_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let chroma_view = chroma_texture.create_view(&wgpu::TextureViewDescriptor::default());
         self.current_video = Some(UploadedVideoFrame {
-            luma: luma_texture,
-            chroma: chroma_texture,
+            luma: luma_view,
+            chroma: chroma_view,
             width,
             height,
             uniforms,
@@ -788,12 +801,8 @@ impl WgpuRenderer {
             .as_ref()
             .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?;
 
-        let luma_view = video
-            .luma
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let chroma_view = video
-            .chroma
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let luma_view = &video.luma;
+        let chroma_view = &video.chroma;
 
         let surface_width = self.stats.surface_width.max(1);
         let surface_height = self.stats.surface_height.max(1);
@@ -1728,6 +1737,112 @@ impl WgpuRenderer {
         self.stats.surface_width = attached.config.width;
         self.stats.surface_height = attached.config.height;
     }
+
+    #[cfg(target_os = "windows")]
+    fn try_upload_d3d11va_frame(
+        &mut self,
+        frame: &PlayerVideoFrame,
+    ) -> Result<Option<()>> {
+        let texture_ptr = match frame.frame.d3d11va_texture_ptr() {
+            Some(ptr) => ptr,
+            None => return Ok(None),
+        };
+
+        let shared_info = match unsafe { crate::windows::get_d3d11_texture_shared_handle(texture_ptr) } {
+            Ok(info) => info,
+            Err(_) => return Ok(None),
+        };
+
+        let width = frame.frame.width();
+        let height = frame.frame.height();
+
+        let hal_device_guard = unsafe { self.device.as_hal::<wgpu::hal::dx12::Api>() };
+        let hal_device = match hal_device_guard.as_deref() {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let d3d12_device = hal_device.raw_device();
+
+        let d3d12_resource: windows::Win32::Graphics::Direct3D12::ID3D12Resource = unsafe {
+            let mut result = None;
+            if d3d12_device
+                .OpenSharedHandle(shared_info.handle, &mut result)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            match result {
+                Some(r) => r,
+                None => return Ok(None),
+            }
+        };
+
+        let hal_texture = unsafe {
+            wgpu::hal::dx12::Device::texture_from_raw(
+                d3d12_resource,
+                wgpu::TextureFormat::NV12,
+                wgpu::TextureDimension::D2,
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                1,
+                1,
+            )
+        };
+
+        let wgpu_texture = unsafe {
+            self.device.create_texture_from_hal::<wgpu::hal::dx12::Api>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("erika-wgpu-d3d11va-nv12"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::NV12,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            )
+        };
+
+        let luma_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::Plane0,
+            ..wgpu::TextureViewDescriptor::default()
+        });
+        let chroma_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor {
+            aspect: wgpu::TextureAspect::Plane1,
+            ..wgpu::TextureViewDescriptor::default()
+        });
+
+        let source = SourceColorState::new(
+            frame.frame.color_primaries(),
+            frame.frame.transfer_function(),
+        )
+        .range(frame.frame.color_range())
+        .matrix(frame.frame.matrix_coefficients())
+        .hdr_metadata(frame.frame.hdr_metadata());
+        let pipeline =
+            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+        let uniforms = VideoUniforms::from_pipeline(&pipeline, false, false);
+
+        self.current_video = Some(UploadedVideoFrame {
+            luma: luma_view,
+            chroma: chroma_view,
+            width,
+            height,
+            uniforms,
+        });
+
+        Ok(Some(()))
+    }
 }
 
 fn scaled_surface_size(width: u32, height: u32, scale: f64) -> (u32, u32) {
@@ -1818,11 +1933,17 @@ impl RendererBackend for WgpuRenderer {
                 .adapter
                 .features()
                 .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
-            let required_features = if supports_16bit_norm {
-                wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
-            } else {
-                wgpu::Features::empty()
-            };
+            let supports_vulkan_ext_mem_win32 = self
+                .adapter
+                .features()
+                .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32);
+            let mut required_features = wgpu::Features::empty();
+            if supports_16bit_norm {
+                required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+            }
+            if supports_vulkan_ext_mem_win32 {
+                required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32;
+            }
             let (device, queue) =
                 pollster::block_on(self.adapter.request_device(&wgpu::DeviceDescriptor {
                     label: Some("erika-wgpu-device"),
@@ -1916,6 +2037,10 @@ impl RendererBackend for WgpuRenderer {
     }
 
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        if self.try_upload_d3d11va_frame(frame)?.is_some() {
+            return Ok(());
+        }
 
         let sw_frame;
         let frame_ref = if frame.frame.has_hw_frames_context() {

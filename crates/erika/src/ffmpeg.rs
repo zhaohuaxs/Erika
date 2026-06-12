@@ -632,6 +632,8 @@ impl Decoder {
             unsafe { sys::avcodec_open2(decoder.context, codec, ptr::null_mut()) },
             "avcodec_open2",
         )?;
+        let pix_fmt = unsafe { (*decoder.context).pix_fmt };
+        let _ = pix_fmt;
         Ok(decoder)
     }
 
@@ -677,6 +679,7 @@ impl Decoder {
             return Ok(DecoderOutputFrame::EndOfStream);
         }
         check(code, "avcodec_receive_frame")?;
+
         Ok(DecoderOutputFrame::Frame(frame))
     }
 
@@ -691,7 +694,9 @@ impl Decoder {
         label: &'static str,
     ) -> Result<()> {
         let pixel_format =
-            hardware_pixel_format(codec, device_type)
+            hardware_pixel_format(codec, device_type);
+
+        let pixel_format = pixel_format
                 .ok_or_else(|| FfmpegError::NullPointer(label))?;
         let mut device_ref = ptr::null_mut();
         check(
@@ -716,13 +721,59 @@ impl Decoder {
             return Err(FfmpegError::NullPointer("av_buffer_ref(hw_device_ctx)"));
         }
 
+        unsafe {
+            (*self.context).hw_device_ctx = context_device_ref;
+        }
+
+        let needs_hw_frames_ctx = pixel_format != sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD
+            && pixel_format != sys::AVPixelFormat_AV_PIX_FMT_DXVA2_VLD
+            && pixel_format != sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX;
+
+        let hw_width = unsafe { (*self.context).width };
+        let hw_height = unsafe { (*self.context).height };
+
+
+        if needs_hw_frames_ctx {
+            let mut frames_ref = unsafe { sys::av_hwframe_ctx_alloc(device_ref) };
+            if frames_ref.is_null() {
+                unsafe { sys::av_buffer_unref(&mut device_ref) };
+                return Err(FfmpegError::NullPointer("av_hwframe_ctx_alloc"));
+            }
+            let frames_ctx = unsafe { (*frames_ref).data };
+            if frames_ctx.is_null() {
+                unsafe { sys::av_buffer_unref(&mut frames_ref) };
+                unsafe { sys::av_buffer_unref(&mut device_ref) };
+                return Err(FfmpegError::NullPointer("hwframes data"));
+            }
+            unsafe {
+                let hw_frames = frames_ctx as *mut sys::AVHWFramesContext;
+                (*hw_frames).format = pixel_format;
+                (*hw_frames).sw_format = sys::AVPixelFormat_AV_PIX_FMT_NV12;
+                (*hw_frames).width = hw_width.max(1);
+                (*hw_frames).height = hw_height.max(1);
+            }
+            check(
+                unsafe { sys::av_hwframe_ctx_init(frames_ref) },
+                "av_hwframe_ctx_init",
+            )?;
+            let context_frames_ref = unsafe { sys::av_buffer_ref(frames_ref) };
+            if context_frames_ref.is_null() {
+                unsafe { sys::av_buffer_unref(&mut frames_ref) };
+                unsafe { sys::av_buffer_unref(&mut device_ref) };
+                return Err(FfmpegError::NullPointer("av_buffer_ref(hw_frames_ctx)"));
+            }
+            unsafe {
+                (*self.context).hw_frames_ctx = context_frames_ref;
+            }
+            unsafe { sys::av_buffer_unref(&mut frames_ref) };
+        }
+
         let mut hw_state = Box::new(HardwareDecoderState {
             device_ref,
             pixel_format,
         });
 
         unsafe {
-            (*self.context).hw_device_ctx = context_device_ref;
             (*self.context).opaque = (&mut *hw_state) as *mut HardwareDecoderState as *mut _;
             (*self.context).get_format = Some(select_hw_format);
         }
@@ -848,7 +899,28 @@ impl Frame {
 
     #[cfg(target_os = "windows")]
     pub fn is_d3d11va(&self) -> bool {
-        self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD
+        let fmt = self.raw_pixel_format();
+        fmt == sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD
+            || fmt == 171 // AV_PIX_FMT_D3D11
+    }
+
+    pub fn decode_backend(&self) -> DecoderBackend {
+        if !self.has_hw_frames_context() {
+            return DecoderBackend::Software;
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if self.is_videotoolbox() {
+            return DecoderBackend::VideoToolbox;
+        }
+        #[cfg(target_os = "windows")]
+        if self.is_d3d11va() {
+            return DecoderBackend::D3d11va;
+        }
+        #[cfg(target_os = "windows")]
+        if self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_DXVA2_VLD {
+            return DecoderBackend::Dxva2;
+        }
+        DecoderBackend::Software
     }
 
     pub fn has_hw_frames_context(&self) -> bool {
@@ -870,6 +942,23 @@ impl Frame {
             height: self.height(),
             _frame: PhantomData,
         })
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn d3d11va_texture_ptr(&self) -> Option<*mut c_void> {
+        if !self.is_d3d11va() {
+            return None;
+        }
+        let fmt = self.raw_pixel_format();
+        let raw = if fmt == sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD {
+            unsafe { (*self.ptr).data[3] }.cast::<c_void>()
+        } else {
+            unsafe { (*self.ptr).data[0] }.cast::<c_void>()
+        };
+        if raw.is_null() {
+            return None;
+        }
+        Some(raw)
     }
 
     pub fn raw_pts(&self) -> Option<i64> {
@@ -2200,20 +2289,26 @@ fn hardware_pixel_format(
     device_type: sys::AVHWDeviceType,
 ) -> Option<sys::AVPixelFormat> {
     let mut index = 0;
+    let mut hw_device_fmt = None;
+    let mut hw_frames_fmt = None;
     loop {
         let config = unsafe { sys::avcodec_get_hw_config(codec, index) };
         if config.is_null() {
-            return None;
+            break;
         }
-        let supports_device_ctx = unsafe {
-            (*config).device_type == device_type
-                && ((*config).methods & sys::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0
-        };
-        if supports_device_ctx {
-            return Some(unsafe { (*config).pix_fmt });
+        let methods = unsafe { (*config).methods };
+        let matches_device = unsafe { (*config).device_type == device_type };
+        if matches_device {
+            if (methods & sys::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32) != 0 && hw_device_fmt.is_none() {
+                hw_device_fmt = Some(unsafe { (*config).pix_fmt });
+            }
+            if (methods & sys::AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX as i32) != 0 && hw_frames_fmt.is_none() {
+                hw_frames_fmt = Some(unsafe { (*config).pix_fmt });
+            }
         }
         index += 1;
     }
+    hw_device_fmt.or(hw_frames_fmt)
 }
 
 unsafe extern "C" fn select_hw_format(

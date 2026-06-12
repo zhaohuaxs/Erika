@@ -160,6 +160,7 @@ pub struct PresenterRuntimeSnapshot {
     pub last_render_duration: Duration,
     pub last_render_current_duration: Duration,
     pub last_render_test_duration: Duration,
+    pub video_decode_backend: Option<crate::ffmpeg::DecoderBackend>,
 }
 
 pub struct PresenterRuntime {
@@ -196,6 +197,7 @@ pub struct PresenterRuntime {
     last_render_duration: Duration,
     last_render_current_duration: Duration,
     last_render_test_duration: Duration,
+    video_decode_backend: Option<crate::ffmpeg::DecoderBackend>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +308,7 @@ impl PresenterRuntime {
             last_render_duration: Duration::ZERO,
             last_render_current_duration: Duration::ZERO,
             last_render_test_duration: Duration::ZERO,
+            video_decode_backend: None,
         })
     }
 
@@ -682,6 +685,7 @@ impl PresenterRuntime {
             last_render_duration: self.last_render_duration,
             last_render_current_duration: self.last_render_current_duration,
             last_render_test_duration: self.last_render_test_duration,
+            video_decode_backend: self.video_decode_backend,
         }
     }
 
@@ -692,6 +696,7 @@ impl PresenterRuntime {
                     if frame.generation < self.player.playback_generation() {
                         continue;
                     }
+                    self.video_decode_backend = Some(frame.frame.decode_backend());
                     self.stats.decoded_video_frames += 1;
                     match self.renderer.upload_player_frame(&frame) {
                         Ok(()) => {

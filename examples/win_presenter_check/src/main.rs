@@ -139,8 +139,17 @@ fn main() {
             let danmaku_items_total = stats.danmaku_items;
             let rendered = stats.rendered_video_frames;
 
+            let decode_label = match snapshot.video_decode_backend {
+                Some(erika::ffmpeg::DecoderBackend::D3d11va) => "D3D11VA",
+                Some(erika::ffmpeg::DecoderBackend::Dxva2) => "DXVA2",
+                Some(erika::ffmpeg::DecoderBackend::Software) => "SW",
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                Some(erika::ffmpeg::DecoderBackend::VideoToolbox) => "VT",
+                None => "-",
+            };
+
             let mut title = format!(
-                "Erika | wgpu+WASAPI | {:.0} fps | video: {} | rendered: {rendered}",
+                "Erika | wgpu+WASAPI | {decode_label} | {:.0} fps | video: {} | rendered: {rendered}",
                 display_fps,
                 fmt_duration(media_time),
             );
