@@ -1296,8 +1296,8 @@ impl SubtitleFrameState {
         overlay: &mut OverlayFrame,
         frames: &[DecodedSubtitleFrame],
     ) {
-        match self.text_renderer.render(pts, overlay.viewport, frames) {
-            Ok(Some(frame)) => overlay.subtitle_planes.extend(frame.planes),
+        match self.text_renderer.render_alpha(pts, overlay.viewport, frames) {
+            Ok(Some(bitmaps)) => overlay.subtitle_alpha_planes.extend(bitmaps.parts),
             Ok(None) => {}
             Err(error) => {
                 eprintln!("Erika presenter text subtitle render failed: {error}");
@@ -1326,12 +1326,12 @@ struct CachedLibassTextRenderer {
 
 #[cfg(feature = "libass")]
 impl CachedLibassTextRenderer {
-    fn render(
+    fn render_alpha(
         &mut self,
         pts: Duration,
         viewport: OverlayViewport,
         frames: &[DecodedSubtitleFrame],
-    ) -> crate::subtitle::Result<Option<crate::subtitle::SubtitleFrame>> {
+    ) -> crate::subtitle::Result<Option<crate::subtitle::SubtitleBitmapSet>> {
         let fallback_end = pts.saturating_add(Duration::from_secs(24 * 60 * 60));
         let Some(script) = decoded_subtitle_frames_to_ass_script(frames.iter(), fallback_end)
         else {
@@ -1350,13 +1350,21 @@ impl CachedLibassTextRenderer {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(None);
         };
-        renderer
-            .render(SubtitleRenderRequest::new(
-                pts,
-                viewport.width,
-                viewport.height,
-            ))
-            .map(|output| Some(output.into_rgba_frame()))
+        let output = renderer.render(SubtitleRenderRequest::new(
+            pts,
+            viewport.width,
+            viewport.height,
+        ))?;
+        match output {
+            crate::subtitle::SubtitleRenderOutput::Alpha(bitmaps) => {
+                if bitmaps.parts.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(bitmaps))
+                }
+            }
+            crate::subtitle::SubtitleRenderOutput::Rgba(_) => Ok(None),
+        }
     }
 }
 
@@ -1534,7 +1542,9 @@ mod tests {
 
         state.append_to_overlay(Duration::from_secs(2), &mut overlay);
 
-        assert!(!overlay.subtitle_planes.is_empty());
+        assert!(
+            !overlay.subtitle_planes.is_empty() || !overlay.subtitle_alpha_planes.is_empty()
+        );
         assert!(overlay.subtitle_changed);
     }
 

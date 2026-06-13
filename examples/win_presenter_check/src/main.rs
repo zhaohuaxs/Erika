@@ -87,6 +87,13 @@ fn main() {
         }
     }
 
+    if let Some(path) = args.next() {
+        match presenter.add_external_subtitle(&path) {
+            Ok(track) => eprintln!("added subtitle track #{}: {path}", track.id),
+            Err(e) => eprintln!("failed to add subtitle {path}: {e}"),
+        }
+    }
+
     if let Err(e) = presenter.play() {
         eprintln!("failed to play: {e}");
         std::process::exit(1);
@@ -103,7 +110,7 @@ fn main() {
 
     while running {
         while unsafe { PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
-            if msg.message == WM_DESTROY {
+            if msg.message == WM_QUIT {
                 running = false;
                 break;
             }

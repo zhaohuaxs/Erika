@@ -11,6 +11,7 @@ const LIBASS_VERSION: &str = "0.17.3";
 const HARFBUZZ_VERSION: &str = "10.4.0";
 const FREETYPE_VERSION: &str = "2.13.3";
 const FRIBIDI_VERSION: &str = "1.0.16";
+const PKGCONF_VERSION: &str = "2.4.3";
 
 const FFMPEG_ARCHIVE: &str = "ffmpeg-7.1.1.tar.xz";
 const FFMPEG_DIR: &str = "ffmpeg-7.1.1";
@@ -142,6 +143,57 @@ impl NativeDependencyProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildTarget {
+    Apple(AppleTarget),
+    Windows(WindowsTarget),
+}
+
+impl BuildTarget {
+    fn triple(self) -> Option<&'static str> {
+        match self {
+            Self::Apple(t) => t.triple(),
+            Self::Windows(t) => Some(t.triple()),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn is_windows(self) -> bool {
+        matches!(self, Self::Windows(_))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsTarget {
+    X86_64Msvc,
+    Aarch64Msvc,
+}
+
+impl WindowsTarget {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "x86_64-pc-windows-msvc" => Ok(Self::X86_64Msvc),
+            "aarch64-pc-windows-msvc" => Ok(Self::Aarch64Msvc),
+            other => bail!("unknown Windows target: {other}"),
+        }
+    }
+
+    fn triple(self) -> &'static str {
+        match self {
+            Self::X86_64Msvc => "x86_64-pc-windows-msvc",
+            Self::Aarch64Msvc => "aarch64-pc-windows-msvc",
+        }
+    }
+
+    #[allow(dead_code)]
+    fn cmake_arch(self) -> &'static str {
+        match self {
+            Self::X86_64Msvc => "x64",
+            Self::Aarch64Msvc => "ARM64",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppleTarget {
     Host,
     Aarch64Macos,
@@ -237,7 +289,7 @@ impl AppleTarget {
 #[derive(Debug, Clone, Copy)]
 struct DepsOptions {
     profile: NativeDependencyProfile,
-    target: AppleTarget,
+    target: BuildTarget,
     force: bool,
     all: bool,
     jobs: Option<usize>,
@@ -247,7 +299,7 @@ impl DepsOptions {
     fn parse(args: &[String]) -> Result<Self> {
         let mut options = Self {
             profile: NativeDependencyProfile::Lgpl,
-            target: AppleTarget::Host,
+            target: BuildTarget::Apple(AppleTarget::Host),
             force: false,
             all: false,
             jobs: None,
@@ -266,7 +318,11 @@ impl DepsOptions {
                 }
                 "--target" => {
                     let value = args.get(index + 1).context("--target requires a value")?;
-                    options.target = AppleTarget::parse(value)?;
+                    if value.contains("windows") {
+                        options.target = BuildTarget::Windows(WindowsTarget::parse(value)?);
+                    } else {
+                        options.target = BuildTarget::Apple(AppleTarget::parse(value)?);
+                    }
                     index += 2;
                 }
                 "--force" => {
@@ -322,26 +378,20 @@ struct WorkspaceLayout {
 
 fn workspace_layout(
     profile: NativeDependencyProfile,
-    target: AppleTarget,
+    target: BuildTarget,
 ) -> Result<WorkspaceLayout> {
     let root = workspace_root()?;
     let cache_dir = root.join("third_party/cache");
     let source_dir = root.join("third_party/src");
-    let (build_dir, dist_dir) = if let Some(triple) = target.triple() {
-        (
-            root.join("third_party/build")
-                .join(triple)
-                .join(profile_name(profile)),
-            root.join("third_party/dist")
-                .join(triple)
-                .join(profile_name(profile)),
-        )
-    } else {
-        (
-            root.join("third_party/build").join(profile_name(profile)),
-            root.join("third_party/dist").join(profile_name(profile)),
-        )
-    };
+    let target_dir_name = target.triple().unwrap_or("host");
+    let (build_dir, dist_dir) = (
+        root.join("third_party/build")
+            .join(target_dir_name)
+            .join(profile_name(profile)),
+        root.join("third_party/dist")
+            .join(target_dir_name)
+            .join(profile_name(profile)),
+    );
     let ffmpeg_source_dir = source_dir.join(FFMPEG_DIR);
     let ffmpeg_build_dir = build_dir.join("ffmpeg");
     let ffmpeg_build_marker = ffmpeg_build_dir.join("ffmpeg-built.txt");
@@ -393,7 +443,7 @@ fn workspace_layout(
     })
 }
 
-fn print_dependency_plan(profile: NativeDependencyProfile, target: AppleTarget) {
+fn print_dependency_plan(profile: NativeDependencyProfile, target: BuildTarget) {
     println!("Erika native dependency plan");
     println!("profile: {}", profile_name(profile));
     println!("target: {}", target.triple().unwrap_or("host"));
@@ -432,11 +482,15 @@ fn fetch_dependency_sources(layout: &WorkspaceLayout, all: bool) -> Result<()> {
 }
 
 fn build_dependencies(options: DepsOptions) -> Result<()> {
-    ensure_required_tools()?;
+    ensure_required_tools(options.target)?;
     let layout = workspace_layout(options.profile, options.target)?;
     prepare_dependency_dirs(&layout)?;
     fetch_dependency_sources(&layout, options.all)?;
-    build_ffmpeg(&layout, options)?;
+    if !options.target.is_windows() {
+        build_ffmpeg(&layout, options)?;
+    } else {
+        println!("skip FFmpeg build on Windows; use vcpkg (ERIKA_FFMPEG_DIR) instead");
+    }
     if options.all {
         build_text_dependencies(&layout, options)?;
     }
@@ -449,6 +503,12 @@ fn build_dependencies(options: DepsOptions) -> Result<()> {
 }
 
 fn print_dependency_status(layout: &WorkspaceLayout) -> Result<()> {
+    let is_windows = layout.dist_dir.to_str().map_or(false, |s| s.contains("windows"));
+    let (lib_suffix, freetype_lib, harfbuzz_lib, fribidi_lib, libass_lib) = if is_windows {
+        (".lib", "freetype.lib", "harfbuzz.lib", "fribidi.lib", "ass.lib")
+    } else {
+        (".a", "libfreetype.a", "libharfbuzz.a", "libfribidi.a", "libass.a")
+    };
     println!("Erika native dependency status");
     println!("workspace: {}", layout.root.display());
     println!("cache dir: {}", layout.cache_dir.display());
@@ -460,7 +520,7 @@ fn print_dependency_status(layout: &WorkspaceLayout) -> Result<()> {
     );
     println!(
         "ffmpeg dist: {}",
-        status_word(layout.ffmpeg_prefix.join("lib/libavformat.a").exists())
+        status_word(layout.ffmpeg_prefix.join(format!("lib/libavformat{lib_suffix}")).exists())
     );
     println!(
         "libass source: {}",
@@ -480,19 +540,19 @@ fn print_dependency_status(layout: &WorkspaceLayout) -> Result<()> {
     );
     println!(
         "freetype dist: {}",
-        status_word(layout.freetype_prefix.join("lib/libfreetype.a").exists())
+        status_word(layout.freetype_prefix.join(format!("lib/{freetype_lib}")).exists())
     );
     println!(
         "harfbuzz dist: {}",
-        status_word(layout.harfbuzz_prefix.join("lib/libharfbuzz.a").exists())
+        status_word(layout.harfbuzz_prefix.join(format!("lib/{harfbuzz_lib}")).exists())
     );
     println!(
         "fribidi dist: {}",
-        status_word(layout.fribidi_prefix.join("lib/libfribidi.a").exists())
+        status_word(layout.fribidi_prefix.join(format!("lib/{fribidi_lib}")).exists())
     );
     println!(
         "libass dist: {}",
-        status_word(layout.libass_prefix.join("lib/libass.a").exists())
+        status_word(layout.libass_prefix.join(format!("lib/{libass_lib}")).exists())
     );
     if layout.dist_dir.join("erika-native-deps.txt").exists() {
         println!(
@@ -520,30 +580,440 @@ fn prepare_dependency_dirs(layout: &WorkspaceLayout) -> Result<()> {
     Ok(())
 }
 
-fn ensure_required_tools() -> Result<()> {
-    for tool in [
-        "curl",
-        "tar",
-        "xz",
-        "make",
-        "clang",
-        "cmake",
-        "python3",
-        "pkg-config",
-    ] {
-        if which(tool).is_none() {
-            bail!("required build tool `{tool}` was not found in PATH");
+fn ensure_required_tools(target: BuildTarget) -> Result<()> {
+    match target {
+        BuildTarget::Apple(_) => {
+            for tool in [
+                "curl",
+                "tar",
+                "xz",
+                "make",
+                "clang",
+                "cmake",
+                "python3",
+                "pkg-config",
+            ] {
+                if which(tool).is_none() {
+                    bail!("required build tool `{tool}` was not found in PATH");
+                }
+            }
+        }
+        BuildTarget::Windows(_) => {
+            ensure_vs_environment();
+            for tool in ["cmake", "python"] {
+                if which(tool).is_none() {
+                    bail!("required build tool `{tool}` was not found in PATH (even after VS environment setup)");
+                }
+            }
+            if which("cl").is_none() && which("cl.exe").is_none() {
+                bail!(
+                    "MSVC compiler not found in PATH after VS environment setup.\n\
+                     Install Visual Studio Build Tools with C++ workload from:\n\
+                     https://visualstudio.microsoft.com/visual-cpp-build-tools/"
+                );
+            }
         }
     }
     Ok(())
 }
 
+fn ensure_vs_environment() {
+    if which("cl").is_some() || which("cl.exe").is_some() {
+        return;
+    }
+    let vs_install_dir = find_vs_install_dir();
+    if let Some(vs_dir) = &vs_install_dir {
+        let vcvarsall = vs_dir.join("VC\\Auxiliary\\Build\\vcvarsall.bat");
+        if vcvarsall.exists() {
+            if let Ok(env_vars) = capture_vcvarsall_env(&vcvarsall) {
+                for (key, value) in &env_vars {
+                    unsafe { env::set_var(key, value) };
+                }
+                return;
+            }
+        }
+    }
+    let vs_dir = vs_install_dir.unwrap_or_else(|| PathBuf::from("D:\\Devs\\VisualStudio\\BuildTools"));
+    let cmake_bin = vs_dir.join("Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin");
+    if cmake_bin.join("cmake.exe").exists() {
+        let mut paths = vec![cmake_bin];
+        if let Some(path) = env::var_os("PATH") {
+            paths.extend(env::split_paths(&path));
+        }
+        let new_path = env::join_paths(paths).expect("PATH entries are valid");
+        unsafe { env::set_var("PATH", &new_path) };
+    }
+}
+
+fn find_vs_install_dir() -> Option<PathBuf> {
+    let vswhere_paths = [
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe",
+        r"C:\Program Files\Microsoft Visual Studio\Installer\vswhere.exe",
+    ];
+    for vswhere in &vswhere_paths {
+        if !Path::new(vswhere).exists() {
+            continue;
+        }
+        let output = Command::new(vswhere)
+            .args(["-latest", "-property", "installationPath"])
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+    for base in ["D:\\Devs\\VisualStudio", "C:\\Program Files\\Microsoft Visual Studio"] {
+        for edition in ["BuildTools", "Community", "Professional", "Enterprise"] {
+            let dir = PathBuf::from(base).join(edition);
+            if dir.join("VC\\Auxiliary\\Build\\vcvarsall.bat").exists() {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+fn capture_vcvarsall_env(vcvarsall: &Path) -> Result<Vec<(String, String)>, anyhow::Error> {
+    let script = format!(
+        "@echo off\r\ncall \"{}\" x64 >nul 2>&1\r\nset\r\n",
+        vcvarsall.display()
+    );
+    let tmp_dir = std::env::temp_dir();
+    let bat_path = tmp_dir.join("erika_vcvarsall_env.bat");
+    fs::write(&bat_path, &script).with_context(|| format!("write {}", bat_path.display()))?;
+    let output = Command::new("cmd.exe")
+        .args(["/C", &bat_path.display().to_string()])
+        .output()
+        .context("spawn cmd.exe for vcvarsall env capture")?;
+    let _ = fs::remove_file(&bat_path);
+    if !output.status.success() {
+        return Err(anyhow::anyhow!("vcvarsall env capture failed"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut env_vars = Vec::new();
+    for line in stdout.lines() {
+        if let Some((key, value)) = line.split_once('=') {
+            let key_upper = key.to_uppercase();
+            if ["PATH", "INCLUDE", "LIB", "LIBPATH", "WINDOWSSDKDIR", "VCTOOLSINSTALLDIR"]
+                .contains(&key_upper.as_str())
+            {
+                env_vars.push((key.to_string(), value.to_string()));
+            }
+        }
+    }
+    Ok(env_vars)
+}
+
 fn build_text_dependencies(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
-    build_freetype(layout, options)?;
-    build_harfbuzz(layout, options)?;
-    build_fribidi(layout, options)?;
-    build_libass(layout, options)?;
+    match options.target {
+        BuildTarget::Apple(_) => {
+            build_freetype(layout, options)?;
+            build_harfbuzz(layout, options)?;
+            build_fribidi(layout, options)?;
+            build_libass(layout, options)?;
+        }
+        BuildTarget::Windows(windows_target) => {
+            build_freetype_windows(layout, options, windows_target)?;
+            build_harfbuzz_windows(layout, options, windows_target)?;
+            build_fribidi_windows(layout, options)?;
+            build_libass_windows(layout, options)?;
+        }
+    }
     Ok(())
+}
+
+fn apple_target(target: BuildTarget) -> Result<AppleTarget> {
+    match target {
+        BuildTarget::Apple(t) => Ok(t),
+        BuildTarget::Windows(_) => bail!("expected Apple target, got Windows"),
+    }
+}
+
+fn visual_studio_generator() -> Result<&'static str> {
+    let output = Command::new("cmake")
+        .arg("--help")
+        .output()
+        .context("spawn cmake --help")?;
+    let help = String::from_utf8_lossy(&output.stdout);
+    if help.contains("Visual Studio 17 2022") {
+        Ok("Visual Studio 17 2022")
+    } else if help.contains("Visual Studio 16 2019") {
+        Ok("Visual Studio 16 2019")
+    } else {
+        bail!("Visual Studio 2019 or later not found. Install Visual Studio Build Tools from https://visualstudio.microsoft.com/visual-cpp-build-tools/");
+    }
+}
+
+fn cmake_generator_and_arch() -> Result<(&'static str, Option<&'static str>)> {
+    if which("ninja").is_some() {
+        return Ok(("Ninja", None));
+    }
+    let vs_generator = visual_studio_generator()?;
+    Ok((vs_generator, Some("x64")))
+}
+
+fn build_freetype_windows(
+    layout: &WorkspaceLayout,
+    options: DepsOptions,
+    _windows_target: WindowsTarget,
+) -> Result<()> {
+    if layout.freetype_build_marker.exists() && !options.force {
+        println!(
+            "reuse FreeType build marker {}",
+            layout.freetype_build_marker.display()
+        );
+        return Ok(());
+    }
+    clean_build_and_prefix(options, &layout.freetype_build_dir, &layout.freetype_prefix)?;
+    fs::create_dir_all(&layout.freetype_build_dir)
+        .with_context(|| format!("create {}", layout.freetype_build_dir.display()))?;
+    fs::create_dir_all(&layout.freetype_prefix)
+        .with_context(|| format!("create {}", layout.freetype_prefix.display()))?;
+
+    let (generator, cmake_arch) = cmake_generator_and_arch()?;
+    println!("configure FreeType (Windows, {generator})");
+    let mut configure = Command::new("cmake");
+    configure
+        .arg("-S")
+        .arg(&layout.freetype_source_dir)
+        .arg("-B")
+        .arg(&layout.freetype_build_dir)
+        .arg("-G")
+        .arg(generator);
+    if let Some(arch) = cmake_arch {
+        configure.arg("-A").arg(arch);
+    }
+    configure
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg("-DBUILD_SHARED_LIBS=OFF")
+        .arg(format!(
+            "-DCMAKE_INSTALL_PREFIX={}",
+            layout.freetype_prefix.display()
+        ))
+        .arg("-DFT_DISABLE_ZLIB=TRUE")
+        .arg("-DFT_DISABLE_BZIP2=TRUE")
+        .arg("-DFT_DISABLE_PNG=TRUE")
+        .arg("-DFT_DISABLE_HARFBUZZ=TRUE")
+        .arg("-DFT_DISABLE_BROTLI=TRUE");
+    run(&mut configure)?;
+    cmake_build_install(&layout.freetype_build_dir, options.jobs)?;
+    write_marker(
+        &layout.freetype_build_marker,
+        "freetype",
+        FREETYPE_VERSION,
+        &layout.freetype_prefix,
+    )
+}
+
+fn build_harfbuzz_windows(
+    layout: &WorkspaceLayout,
+    options: DepsOptions,
+    _windows_target: WindowsTarget,
+) -> Result<()> {
+    if layout.harfbuzz_build_marker.exists() && !options.force {
+        println!(
+            "reuse HarfBuzz build marker {}",
+            layout.harfbuzz_build_marker.display()
+        );
+        return Ok(());
+    }
+    clean_build_and_prefix(options, &layout.harfbuzz_build_dir, &layout.harfbuzz_prefix)?;
+    fs::create_dir_all(&layout.harfbuzz_build_dir)
+        .with_context(|| format!("create {}", layout.harfbuzz_build_dir.display()))?;
+    fs::create_dir_all(&layout.harfbuzz_prefix)
+        .with_context(|| format!("create {}", layout.harfbuzz_prefix.display()))?;
+
+    let (generator, cmake_arch) = cmake_generator_and_arch()?;
+    println!("configure HarfBuzz (Windows, {generator})");
+    let mut configure = Command::new("cmake");
+    configure
+        .arg("-S")
+        .arg(&layout.harfbuzz_source_dir)
+        .arg("-B")
+        .arg(&layout.harfbuzz_build_dir)
+        .arg("-G")
+        .arg(generator);
+    if let Some(arch) = cmake_arch {
+        configure.arg("-A").arg(arch);
+    }
+    configure
+        .arg("-DCMAKE_BUILD_TYPE=Release")
+        .arg("-DBUILD_SHARED_LIBS=OFF")
+        .arg(format!(
+            "-DCMAKE_INSTALL_PREFIX={}",
+            layout.harfbuzz_prefix.display()
+        ))
+        .arg("-DHB_HAVE_FREETYPE=OFF")
+        .arg("-DHB_HAVE_GLIB=OFF")
+        .arg("-DHB_HAVE_GOBJECT=OFF")
+        .arg("-DHB_HAVE_ICU=OFF")
+        .arg("-DHB_HAVE_CAIRO=OFF")
+        .arg("-DHB_HAVE_CORETEXT=OFF")
+        .arg("-DHB_BUILD_UTILS=OFF")
+        .arg("-DHB_BUILD_SUBSET=OFF");
+    run(&mut configure)?;
+    cmake_build_install(&layout.harfbuzz_build_dir, options.jobs)?;
+    write_marker(
+        &layout.harfbuzz_build_marker,
+        "harfbuzz",
+        HARFBUZZ_VERSION,
+        &layout.harfbuzz_prefix,
+    )
+}
+
+fn build_fribidi_windows(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
+    if layout.fribidi_build_marker.exists() && !options.force {
+        println!(
+            "reuse FriBidi build marker {}",
+            layout.fribidi_build_marker.display()
+        );
+        return Ok(());
+    }
+    let meson = ensure_meson_tools(layout)?;
+    clean_build_and_prefix(options, &layout.fribidi_build_dir, &layout.fribidi_prefix)?;
+    fs::create_dir_all(&layout.fribidi_prefix)
+        .with_context(|| format!("create {}", layout.fribidi_prefix.display()))?;
+    println!("configure FriBidi (Windows, Meson+MSVC)");
+    let mut setup = meson_command(&meson);
+    setup
+        .arg("setup")
+        .arg(&layout.fribidi_build_dir)
+        .arg(&layout.fribidi_source_dir)
+        .arg(format!("--prefix={}", layout.fribidi_prefix.display()))
+        .arg("--default-library=static")
+        .arg("--buildtype=release")
+        .arg("-Ddocs=false")
+        .arg("-Dtests=false");
+    run(&mut setup)?;
+    meson_compile_install(&meson, &layout.fribidi_build_dir, options.jobs)?;
+    write_marker(
+        &layout.fribidi_build_marker,
+        "fribidi",
+        FRIBIDI_VERSION,
+        &layout.fribidi_prefix,
+    )
+}
+
+fn windows_include_path(prefixes: &[&PathBuf]) -> String {
+    let mut parts: Vec<String> = prefixes
+        .iter()
+        .map(|p| p.join("include").display().to_string())
+        .collect();
+    if let Ok(existing) = env::var("INCLUDE") {
+        if !existing.is_empty() {
+            parts.push(existing);
+        }
+    }
+    parts.join(";")
+}
+
+fn windows_lib_path(prefixes: &[&PathBuf]) -> String {
+    let mut parts: Vec<String> = prefixes
+        .iter()
+        .map(|p| p.join("lib").display().to_string())
+        .collect();
+    if let Ok(existing) = env::var("LIB") {
+        if !existing.is_empty() {
+            parts.push(existing);
+        }
+    }
+    parts.join(";")
+}
+
+fn build_libass_windows(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
+    if layout.libass_build_marker.exists() && !options.force {
+        println!(
+            "reuse libass build marker {}",
+            layout.libass_build_marker.display()
+        );
+        return Ok(());
+    }
+    let meson = ensure_meson_tools(layout)?;
+    ensure_pkg_config_windows(&meson.bin_dir, &layout.cache_dir)?;
+    clean_build_and_prefix(options, &layout.libass_build_dir, &layout.libass_prefix)?;
+    fs::create_dir_all(&layout.libass_prefix)
+        .with_context(|| format!("create {}", layout.libass_prefix.display()))?;
+    fs::create_dir_all(&layout.libass_build_dir)
+        .with_context(|| format!("create {}", layout.libass_build_dir.display()))?;
+
+    let dep_prefixes: [&PathBuf; 3] = [
+        &layout.freetype_prefix,
+        &layout.harfbuzz_prefix,
+        &layout.fribidi_prefix,
+    ];
+    let include = windows_include_path(&dep_prefixes);
+    let lib = windows_lib_path(&dep_prefixes);
+    let pkg_config_path = pkg_config_path(dep_prefixes.iter().copied());
+
+
+    let native_file_path = layout.libass_build_dir.join("meson-native.ini");
+    let native_file_content = format!(
+        "[binaries]\n\
+         pkgconfig = '{pkgconfig}'\n"
+        ,
+        pkgconfig = to_meson_path(&layout.python_tools_dir.join("bin/pkg-config.exe")),
+    );
+    fs::write(&native_file_path, &native_file_content)
+        .with_context(|| format!("write {}", native_file_path.display()))?;
+
+    ensure_pkg_config_windows(&meson.bin_dir, &layout.cache_dir)?;
+
+    println!("configure libass (Windows, Meson+MSVC, native-file)");
+    let mut setup = meson_command(&meson);
+    setup
+        .arg("setup")
+        .arg(&layout.libass_build_dir)
+        .arg(&layout.libass_source_dir)
+        .arg(format!("--prefix={}", layout.libass_prefix.display()))
+        .arg("--default-library=static")
+        .arg("--buildtype=release")
+        .arg(format!("--native-file={}", to_meson_path(&native_file_path)))
+        .arg("-Dtest=false")
+        .arg("-Dprofile=false")
+        .arg("-Dfontconfig=disabled")
+        .arg("-Dcoretext=disabled")
+        .arg("-Dasm=disabled")
+        .arg("-Dlibunibreak=disabled")
+        .env("INCLUDE", &include)
+        .env("LIB", &lib)
+        .env("PKG_CONFIG_PATH", &pkg_config_path);
+    run(&mut setup)?;
+
+    let mut compile = meson_command(&meson);
+    compile
+        .arg("compile")
+        .arg("-C")
+        .arg(&layout.libass_build_dir)
+        .env("INCLUDE", &include)
+        .env("LIB", &lib)
+        .env("PKG_CONFIG_PATH", &pkg_config_path);
+    if let Some(jobs) = options.jobs {
+        compile.arg(format!("-j{jobs}"));
+    }
+    run(&mut compile)?;
+    let mut install = meson_command(&meson);
+    install
+        .arg("install")
+        .arg("-C")
+        .arg(&layout.libass_build_dir)
+        .env("INCLUDE", &include)
+        .env("LIB", &lib)
+        .env("PKG_CONFIG_PATH", &pkg_config_path);
+    run(&mut install)?;
+
+    write_marker(
+        &layout.libass_build_marker,
+        "libass",
+        LIBASS_VERSION,
+        &layout.libass_prefix,
+    )
+}
+
+fn to_meson_path(path: &Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn build_freetype(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
@@ -578,7 +1048,7 @@ fn build_freetype(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .arg("-DFT_DISABLE_PNG=TRUE")
         .arg("-DFT_DISABLE_HARFBUZZ=TRUE")
         .arg("-DFT_DISABLE_BROTLI=TRUE");
-    apply_cmake_apple_target(&mut configure, options.target)?;
+    apply_cmake_apple_target(&mut configure, apple_target(options.target)?)?;
     run(&mut configure)?;
     cmake_build_install(&layout.freetype_build_dir, options.jobs)?;
     write_marker(
@@ -624,7 +1094,7 @@ fn build_harfbuzz(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> 
         .arg("-DHB_HAVE_CORETEXT=ON")
         .arg("-DHB_BUILD_UTILS=OFF")
         .arg("-DHB_BUILD_SUBSET=OFF");
-    apply_cmake_apple_target(&mut configure, options.target)?;
+    apply_cmake_apple_target(&mut configure, apple_target(options.target)?)?;
     run(&mut configure)?;
     cmake_build_install(&layout.harfbuzz_build_dir, options.jobs)?;
     write_marker(
@@ -658,7 +1128,7 @@ fn build_fribidi(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("--buildtype=release")
         .arg("-Ddocs=false")
         .arg("-Dtests=false");
-    apply_meson_apple_target(&mut setup, layout, options.target, "fribidi")?;
+    apply_meson_apple_target(&mut setup, layout, apple_target(options.target)?, "fribidi")?;
     run(&mut setup)?;
     meson_compile_install(&meson, &layout.fribidi_build_dir, options.jobs)?;
     write_marker(
@@ -703,7 +1173,7 @@ fn build_libass(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
         .arg("-Dasm=disabled")
         .arg("-Dlibunibreak=disabled")
         .env("PKG_CONFIG_PATH", &pkg_config_path);
-    apply_meson_apple_target(&mut setup, layout, options.target, "libass")?;
+    apply_meson_apple_target(&mut setup, layout, apple_target(options.target)?, "libass")?;
     run(&mut setup)?;
 
     let mut compile = meson_command(&meson);
@@ -764,38 +1234,186 @@ fn ensure_meson_tools(layout: &WorkspaceLayout) -> Result<MesonTools> {
         }
     }
 
-    let venv = layout.python_tools_dir.join("venv");
-    let meson = venv.join("bin/meson");
-    let ninja = venv.join("bin/ninja");
-    if meson.exists() && ninja.exists() {
+    let is_windows = cfg!(target_os = "windows");
+    let (meson_path, ninja_path) = if is_windows {
+        (
+            layout.python_tools_dir.join("bin/meson.exe"),
+            layout.python_tools_dir.join("bin/ninja.exe"),
+        )
+    } else {
+        (
+            layout.python_tools_dir.join("venv/bin/meson"),
+            layout.python_tools_dir.join("venv/bin/ninja"),
+        )
+    };
+    if meson_path.exists() && ninja_path.exists() {
+        let bin_dir = meson_path.parent().unwrap_or(Path::new("")).to_path_buf();
         return Ok(MesonTools {
-            meson,
-            bin_dir: venv.join("bin"),
+            meson: meson_path,
+            bin_dir,
         });
     }
 
     fs::create_dir_all(&layout.python_tools_dir)
         .with_context(|| format!("create {}", layout.python_tools_dir.display()))?;
     println!("bootstrap local meson/ninja tools");
-    run(Command::new("python3").arg("-m").arg("venv").arg(&venv))?;
-    run(Command::new(venv.join("bin/python"))
-        .arg("-m")
-        .arg("pip")
-        .arg("install")
-        .arg("--upgrade")
-        .arg("pip")
-        .arg("meson==1.8.5")
-        .arg("ninja==1.13.0"))?;
-    Ok(MesonTools {
-        meson,
-        bin_dir: venv.join("bin"),
-    })
+
+    if is_windows {
+        let python = which("python").or_else(|| which("python3")).context("python not found")?;
+        let has_venv = Command::new(&python)
+            .args(["-m", "venv", "--help"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if has_venv {
+            let venv = layout.python_tools_dir.join("venv");
+            run(Command::new(&python).arg("-m").arg("venv").arg(&venv))?;
+            run(Command::new(venv.join("Scripts/python.exe"))
+                .arg("-m")
+                .arg("pip")
+                .arg("install")
+                .arg("--upgrade")
+                .arg("pip")
+                .arg("meson==1.8.5")
+                .arg("ninja==1.13.0"))?;
+            return Ok(MesonTools {
+                meson: venv.join("Scripts/meson.exe"),
+                bin_dir: venv.join("Scripts"),
+            });
+        }
+        run(Command::new(&python)
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("--target")
+            .arg(&layout.python_tools_dir)
+            .arg("meson==1.8.5")
+            .arg("ninja==1.13.0"))?;
+        Ok(MesonTools {
+            meson: layout.python_tools_dir.join("bin/meson.exe"),
+            bin_dir: layout.python_tools_dir.join("bin"),
+        })
+    } else {
+        let venv = layout.python_tools_dir.join("venv");
+        run(Command::new("python3").arg("-m").arg("venv").arg(&venv))?;
+        run(Command::new(venv.join("bin/python"))
+            .arg("-m")
+            .arg("pip")
+            .arg("install")
+            .arg("--upgrade")
+            .arg("pip")
+            .arg("meson==1.8.5")
+            .arg("ninja==1.13.0"))?;
+        Ok(MesonTools {
+            meson: venv.join("bin/meson"),
+            bin_dir: venv.join("bin"),
+        })
+    }
 }
 
 fn meson_command(meson: &MesonTools) -> Command {
     let mut command = Command::new(&meson.meson);
     prepend_path(&mut command, &meson.bin_dir);
     command
+}
+
+fn ensure_pkg_config_windows(bin_dir: &Path, cache_dir: &Path) -> Result<()> {
+    if which("pkg-config").is_some() {
+        return Ok(());
+    }
+    let pkg_config_exe = bin_dir.join("pkg-config.exe");
+    if pkg_config_exe.exists() {
+        return Ok(());
+    }
+    println!("build pkgconf {} for Windows (pkg-config replacement)", PKGCONF_VERSION);
+    let source_dir = bin_dir.join("_pkgconf_src");
+    let build_dir = bin_dir.join("_pkgconf_build");
+    let install_dir = bin_dir.join("_pkgconf_install");
+    let _ = fs::remove_dir_all(&source_dir);
+    let _ = fs::remove_dir_all(&build_dir);
+    let _ = fs::remove_dir_all(&install_dir);
+    fs::create_dir_all(&source_dir)
+        .with_context(|| format!("create {}", source_dir.display()))?;
+    fs::create_dir_all(&build_dir)
+        .with_context(|| format!("create {}", build_dir.display()))?;
+    fs::create_dir_all(&install_dir)
+        .with_context(|| format!("create {}", install_dir.display()))?;
+
+    let archive_name = format!("pkgconf-{PKGCONF_VERSION}.tar.xz");
+    let archive_path = cache_dir.join(&archive_name);
+    if !archive_path.exists() {
+        let url = format!("https://distfiles.ariadne.space/pkgconf/{archive_name}");
+        download_file(&url, &archive_path)?;
+    }
+    run(Command::new("cmake")
+        .arg("-E")
+        .arg("tar")
+        .arg("xf")
+        .arg(&archive_path)
+        .current_dir(&source_dir))?;
+
+    let pkgconf_source = source_dir.join(format!("pkgconf-{PKGCONF_VERSION}"));
+    let meson_exe = bin_dir.join("meson.exe");
+    let ninja_exe = bin_dir.join("ninja.exe");
+    if !meson_exe.exists() || !ninja_exe.exists() {
+        bail!("meson/ninja not found in {}; cannot build pkgconf", bin_dir.display());
+    }
+    let mut setup = Command::new(&meson_exe);
+    setup
+        .arg("setup")
+        .arg(&build_dir)
+        .arg(&pkgconf_source)
+        .arg(format!("--prefix={}", install_dir.display()))
+        .arg("--default-library=static")
+        .arg("--buildtype=release")
+        .arg("-Dtests=disabled");
+    prepend_path(&mut setup, bin_dir);
+    run(&mut setup)?;
+
+    let mut compile = Command::new(&meson_exe);
+    compile.arg("compile").arg("-C").arg(&build_dir);
+    prepend_path(&mut compile, bin_dir);
+    run(&mut compile)?;
+
+    let mut install = Command::new(&meson_exe);
+    install.arg("install").arg("-C").arg(&build_dir);
+    prepend_path(&mut install, bin_dir);
+    run(&mut install)?;
+
+    let installed_pkgconf = install_dir.join("bin/pkgconf.exe");
+    if installed_pkgconf.exists() {
+        fs::copy(&installed_pkgconf, bin_dir.join("pkgconf.exe"))
+            .with_context(|| "copy pkgconf.exe")?;
+        fs::copy(&installed_pkgconf, &pkg_config_exe)
+            .with_context(|| "copy pkg-config.exe")?;
+    }
+    let _ = fs::remove_dir_all(&source_dir);
+    let _ = fs::remove_dir_all(&build_dir);
+    let _ = fs::remove_dir_all(&install_dir);
+    Ok(())
+}
+
+fn download_file(url: &str, dest: &Path) -> Result<()> {
+    let mut curl = Command::new("cmake");
+    curl.arg("-E")
+        .arg("cmake_echo_color")
+        .arg("--red")
+        .arg(format!("downloading {url}"));
+    let _ = run(&mut curl);
+    let mut curl = Command::new("curl");
+    curl.arg("-L")
+        .arg("--fail")
+        .arg("--show-error")
+        .arg("--connect-timeout")
+        .arg("20")
+        .arg("--max-time")
+        .arg("120")
+        .arg("--output")
+        .arg(dest)
+        .arg(url);
+    run(&mut curl)
 }
 
 fn apply_cmake_apple_target(command: &mut Command, target: AppleTarget) -> Result<()> {
@@ -1084,39 +1702,45 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     configure.arg("--disable-x86asm");
     let mut extra_cflags = vec!["-fPIC".to_string()];
     let mut extra_ldflags = Vec::new();
-    if let Some(config) = apple_toolchain(options.target)? {
-        configure.arg(format!("--cc={}", config.clang.display()));
-        configure.arg(format!("--ar={}", config.ar.display()));
-        configure.arg(format!("--ranlib={}", config.ranlib.display()));
-        configure.arg(format!("--strip={}", config.strip.display()));
-        configure.arg("--target-os=darwin");
-        configure.arg("--enable-cross-compile");
-        configure.arg(format!("--arch={}", config.arch));
-        configure.arg(format!("--sysroot={}", config.sdk_root.display()));
-        extra_cflags.push(format!("-arch {}", config.arch));
-        extra_cflags.push(format!("-isysroot {}", config.sdk_root.display()));
-        extra_cflags.push(format!(
-            "{}={}",
-            config.deployment_flag, config.deployment_target
-        ));
-        extra_ldflags.push(format!("-arch {}", config.arch));
-        extra_ldflags.push(format!("-isysroot {}", config.sdk_root.display()));
-        extra_ldflags.push(format!(
-            "{}={}",
-            config.deployment_flag, config.deployment_target
-        ));
-        configure.env("SDKROOT", &config.sdk_root);
-        match options.target {
-            AppleTarget::Aarch64Macos | AppleTarget::X86_64Macos => {
-                configure.env("MACOSX_DEPLOYMENT_TARGET", &config.deployment_target);
+    if let BuildTarget::Apple(apple_target) = options.target {
+        if let Some(config) = apple_toolchain(apple_target)? {
+            configure.arg(format!("--cc={}", config.clang.display()));
+            configure.arg(format!("--ar={}", config.ar.display()));
+            configure.arg(format!("--ranlib={}", config.ranlib.display()));
+            configure.arg(format!("--strip={}", config.strip.display()));
+            configure.arg("--target-os=darwin");
+            configure.arg("--enable-cross-compile");
+            configure.arg(format!("--arch={}", config.arch));
+            configure.arg(format!("--sysroot={}", config.sdk_root.display()));
+            extra_cflags.push(format!("-arch {}", config.arch));
+            extra_cflags.push(format!("-isysroot {}", config.sdk_root.display()));
+            extra_cflags.push(format!(
+                "{}={}",
+                config.deployment_flag, config.deployment_target
+            ));
+            extra_ldflags.push(format!("-arch {}", config.arch));
+            extra_ldflags.push(format!("-isysroot {}", config.sdk_root.display()));
+            extra_ldflags.push(format!(
+                "{}={}",
+                config.deployment_flag, config.deployment_target
+            ));
+            configure.env("SDKROOT", &config.sdk_root);
+            match apple_target {
+                AppleTarget::Aarch64Macos | AppleTarget::X86_64Macos => {
+                    configure.env("MACOSX_DEPLOYMENT_TARGET", &config.deployment_target);
+                }
+                AppleTarget::Aarch64Ios
+                | AppleTarget::Aarch64IosSimulator
+                | AppleTarget::X86_64IosSimulator => {
+                    configure.env("IPHONEOS_DEPLOYMENT_TARGET", &config.deployment_target);
+                }
+                AppleTarget::Host => {}
             }
-            AppleTarget::Aarch64Ios
-            | AppleTarget::Aarch64IosSimulator
-            | AppleTarget::X86_64IosSimulator => {
-                configure.env("IPHONEOS_DEPLOYMENT_TARGET", &config.deployment_target);
-            }
-            AppleTarget::Host => {}
+        } else {
+            configure.arg("--cc=clang");
         }
+    } else if let BuildTarget::Windows(_) = options.target {
+        bail!("FFmpeg Windows build is not yet supported via xtask; use vcpkg (ERIKA_FFMPEG_DIR) instead");
     } else {
         configure.arg("--cc=clang");
     }
@@ -1191,8 +1815,10 @@ fn apple_toolchain(target: AppleTarget) -> Result<Option<AppleToolchain>> {
 fn write_profile_metadata(
     layout: &WorkspaceLayout,
     profile: NativeDependencyProfile,
-    target: AppleTarget,
+    target: BuildTarget,
 ) -> Result<()> {
+    fs::create_dir_all(&layout.dist_dir)
+        .with_context(|| format!("create {}", layout.dist_dir.display()))?;
     fs::write(
         layout.dist_dir.join("erika-native-deps.txt"),
         format!(
@@ -1273,8 +1899,17 @@ fn source_state(path: &std::path::Path) -> &'static str {
 
 fn which(tool: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
+    let is_windows = cfg!(target_os = "windows");
     env::split_paths(&path)
-        .map(|dir| dir.join(tool))
+        .flat_map(|dir| {
+            let candidate = dir.join(tool);
+            if is_windows && !candidate.exists() {
+                let with_exe = dir.join(format!("{tool}.exe"));
+                vec![candidate, with_exe]
+            } else {
+                vec![candidate]
+            }
+        })
         .find(|candidate| candidate.is_file())
 }
 
@@ -1325,7 +1960,7 @@ fn print_help() {
     println!("  cargo run -p xtask -- deps fetch --profile lgpl [--all]");
     println!("  cargo run -p xtask -- deps status --profile lgpl");
     println!(
-        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios] [--force] [--jobs N]"
+        "  cargo run -p xtask -- deps build --profile lgpl [--target host|aarch64-apple-darwin|x86_64-apple-darwin|aarch64-apple-ios|aarch64-apple-ios-sim|x86_64-apple-ios|x86_64-pc-windows-msvc|aarch64-pc-windows-msvc] [--force] [--jobs N]"
     );
     println!("  cargo run -p xtask -- check license");
 }

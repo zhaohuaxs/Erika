@@ -1149,9 +1149,14 @@ pub fn decoded_subtitle_frames_to_ass_script<'a>(
                     events.push('\n');
                 }
                 SubtitleTextFormat::Ass => {
-                    let text = ass_segment_display_text(&segment.text);
-                    if !text.is_empty() {
-                        push_ass_dialogue(&mut events, start, end, &text);
+                    if let Some(dialogue) = rebuild_lavc_ass_dialogue(&segment.text, start, end) {
+                        events.push_str(&dialogue);
+                        events.push('\n');
+                    } else {
+                        let text = ass_segment_display_text(&segment.text);
+                        if !text.is_empty() {
+                            push_ass_dialogue(&mut events, start, end, &text);
+                        }
                     }
                 }
                 SubtitleTextFormat::PlainText => {
@@ -1236,6 +1241,44 @@ fn clean_ass_text(value: &str) -> String {
     }
     output.trim().to_string()
 }
+
+fn rebuild_lavc_ass_dialogue(value: &str, start: Duration, end: Duration) -> Option<String> {
+    let value = value.trim();
+    if strip_ass_dialogue_prefix(value).is_some() {
+        return None;
+    }
+    let fields = value.splitn(9, ',').collect::<Vec<_>>();
+    if fields.len() != 9 || fields[0].trim().parse::<i64>().is_err() {
+        return None;
+    }
+    let style = fields[2].trim();
+    let margin_l = fields[4].trim();
+    let margin_r = fields[5].trim();
+    let margin_v = fields[6].trim();
+    let effect = fields[7].trim();
+    let text = fields[8].trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut line = String::from("Dialogue: 0,");
+    line.push_str(&format_ass_timestamp(start));
+    line.push(',');
+    line.push_str(&format_ass_timestamp(end));
+    line.push(',');
+    line.push_str(style);
+    line.push_str(",,");
+    line.push_str(margin_l);
+    line.push(',');
+    line.push_str(margin_r);
+    line.push(',');
+    line.push_str(margin_v);
+    line.push(',');
+    line.push_str(effect);
+    line.push(',');
+    line.push_str(text);
+    Some(line)
+}
+
 
 fn ass_segment_display_text(value: &str) -> String {
     let value = value.trim();
@@ -1490,6 +1533,30 @@ Dialogue: 0,0:00:00.00,0:00:02.00,Default,,0,0,0,,Hello libass
         );
 
         assert_eq!(segment.display_text(), "External subtitle");
+    }
+
+    #[test]
+    fn decoded_lavc_ass_payload_preserves_move_override_in_script() {
+        let mut frame = DecodedSubtitleFrame::new(
+            2,
+            Some(Duration::from_secs(0)),
+            Some(Duration::from_secs(8)),
+        );
+        frame.push_text(SubtitleTextSegment::new(
+            SubtitleTextFormat::Ass,
+            "0,0,Default,,0,0,0,,{\\move(2040,40,-120,40)}hello",
+        ));
+
+        let script = frame.to_ass_script(Duration::from_secs(10)).unwrap();
+
+        assert!(
+            script.contains("{\\move(2040,40,-120,40)}hello"),
+            "ASS script should preserve \\move override tag, got: {script}"
+        );
+        assert!(
+            !script.contains("\\{\\move"),
+            "ASS script should not escape curly braces in override tags, got: {script}"
+        );
     }
 
     #[test]

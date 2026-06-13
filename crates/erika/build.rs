@@ -18,10 +18,6 @@ fn main() {
         return;
     }
 
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        println!("cargo:warning=libass feature is not yet supported on Windows; skipping native dependency linking");
-        return;
-    }
 
     let libass = native_dep_dir("ERIKA_LIBASS_DIR", "libass");
     let freetype = native_dep_dir("ERIKA_FREETYPE_DIR", "freetype");
@@ -61,6 +57,14 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreFoundation");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=iconv");
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        println!("cargo:rustc-link-lib=dylib=user32");
+        println!("cargo:rustc-link-lib=dylib=gdi32");
+        println!("cargo:rustc-link-lib=dylib=ole32");
+        println!("cargo:rustc-link-lib=dylib=oleaut32");
+        println!("cargo:rustc-link-lib=dylib=advapi32");
     }
 }
 

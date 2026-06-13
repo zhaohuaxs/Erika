@@ -7,7 +7,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-erika = { path = "../../crates/erika", default-features = false, features = ["wgpu"] }
+erika = { path = "../../crates/erika", default-features = false, features = ["wgpu", "libass"] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

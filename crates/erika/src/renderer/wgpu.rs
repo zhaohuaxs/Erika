@@ -12,7 +12,7 @@ use crate::overlay::OverlayFrame;
 use crate::renderer::pipeline::{
     ColorRange, SourceColorState, TargetColorState, ToneMapOperator, VideoRenderPipeline,
 };
-use crate::subtitle::AssColor;
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WgpuRendererStats {
@@ -152,6 +152,8 @@ fn transfer_code(transfer: TransferFunction) -> u32 {
 
 #[derive(Debug, Clone, Copy)]
 struct VideoPresentationLayout {
+    source_width: f32,
+    source_height: f32,
     target_rect: [f32; 4],
     drawable_width: f32,
     drawable_height: f32,
@@ -174,6 +176,8 @@ impl VideoPresentationLayout {
         let x = (drawable_width - width) * 0.5;
         let y = (drawable_height - height) * 0.5;
         Self {
+            source_width,
+            source_height,
             target_rect: [x, y, width, height],
             drawable_width,
             drawable_height,
@@ -182,6 +186,21 @@ impl VideoPresentationLayout {
 
     fn video_viewport(self) -> [f32; 4] {
         [self.drawable_width, self.drawable_height, 0.0, 0.0]
+    }
+
+    fn overlay_viewport(self) -> [f32; 2] {
+        [self.drawable_width, self.drawable_height]
+    }
+
+    fn map_source_rect(self, x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+        let scale_x = self.target_rect[2] / self.source_width;
+        let scale_y = self.target_rect[3] / self.source_height;
+        [
+            self.target_rect[0] + x * scale_x,
+            self.target_rect[1] + y * scale_y,
+            width * scale_x,
+            height * scale_y,
+        ]
     }
 }
 
@@ -216,13 +235,12 @@ impl OverlayUniforms {
         y: i32,
         width: u32,
         height: u32,
-        viewport_w: u32,
-        viewport_h: u32,
+        layout: VideoPresentationLayout,
     ) -> Self {
         Self {
-            rect: [x as f32, y as f32, width as f32, height as f32],
+            rect: layout.map_source_rect(x as f32, y as f32, width as f32, height as f32),
             tex_rect: [0.0, 0.0, 1.0, 1.0],
-            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            viewport: layout.overlay_viewport(),
             overlay_mode: 0,
             reserved0: 0,
             color: [1.0, 1.0, 1.0, 1.0],
@@ -232,58 +250,18 @@ impl OverlayUniforms {
     /// A libass alpha coverage bitmap sampled from a horizontal R8 atlas at `atlas_x`,
     /// tinted by `color_rgba` (mode 1). Mirrors the Metal `from_alpha_atlas_bitmap`.
     #[allow(clippy::too_many_arguments)]
-    fn alpha_atlas(
-        color_rgba: u32,
-        place_x: i32,
-        place_y: i32,
-        place_w: u32,
-        place_h: u32,
-        atlas_x: u32,
-        atlas_w: u32,
-        atlas_h: u32,
-        viewport_w: u32,
-        viewport_h: u32,
-    ) -> Self {
-        let color = AssColor::from_libass_rgba(color_rgba);
-        let aw = atlas_w.max(1) as f32;
-        let ah = atlas_h.max(1) as f32;
-        Self {
-            rect: [
-                place_x as f32,
-                place_y as f32,
-                place_w as f32,
-                place_h as f32,
-            ],
-            tex_rect: [
-                atlas_x as f32 / aw,
-                0.0,
-                place_w as f32 / aw,
-                place_h as f32 / ah,
-            ],
-            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
-            overlay_mode: 1,
-            reserved0: 0,
-            color: [
-                f32::from(color.red) / 255.0,
-                f32::from(color.green) / 255.0,
-                f32::from(color.blue) / 255.0,
-                f32::from(color.alpha) / 255.0,
-            ],
-        }
-    }
 
     #[allow(dead_code)]
     fn alpha_atlas_rect(
         color: [f32; 4],
         rect: [f32; 4],
         tex_rect: [f32; 4],
-        viewport_w: u32,
-        viewport_h: u32,
+        layout: VideoPresentationLayout,
     ) -> Self {
         Self {
             rect,
             tex_rect,
-            viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
+            viewport: layout.overlay_viewport(),
             overlay_mode: 1,
             reserved0: 0,
             color,
@@ -315,6 +293,8 @@ struct OverlayDraw {
     bind_group: wgpu::BindGroup,
     _texture: wgpu::Texture,
     _uniform: wgpu::Buffer,
+    instance_count: u32,
+    use_batch_pipeline: bool,
 }
 
 struct WgpuDanmakuAtlasCache {
@@ -787,10 +767,6 @@ impl WgpuRenderer {
         overlay: Option<&OverlayFrame>,
         danmaku: Option<&DanmakuRenderPlan>,
     ) -> Result<usize> {
-        let overlay_draws = match overlay {
-            Some(frame) if overlay_has_planes(frame) => self.prepare_overlay_draws(frame)?,
-            _ => Vec::new(),
-        };
         let danmaku_plan = danmaku.filter(|plan| !plan.is_empty());
         let video = self
             .current_video
@@ -812,6 +788,14 @@ impl WgpuRenderer {
             surface_width,
             surface_height,
         );
+
+        let overlay_draws = match overlay {
+            Some(frame) if overlay_has_planes(frame) => {
+
+                self.prepare_overlay_draws(frame, layout)?
+            }
+            _ => Vec::new(),
+        };
 
         let mut uniforms = video.uniforms;
         uniforms.rect = layout.target_rect;
@@ -899,10 +883,19 @@ impl WgpuRenderer {
                 let overlay_pipeline = self.overlay_pipeline.as_ref().ok_or_else(|| {
                     PlayerError::Renderer("overlay pipeline not initialized".to_string())
                 })?;
-                pass.set_pipeline(&overlay_pipeline.pipeline);
+                let batch_pipeline = self.danmaku_batch_pipeline.as_ref();
                 for draw in &overlay_draws {
-                    pass.set_bind_group(0, &draw.bind_group, &[]);
-                    pass.draw(0..6, 0..1);
+                    if draw.use_batch_pipeline {
+                        if let Some(bp) = &batch_pipeline {
+                            pass.set_pipeline(&bp.pipeline);
+                            pass.set_bind_group(0, &draw.bind_group, &[]);
+                            pass.draw(0..6, 0..draw.instance_count);
+                        }
+                    } else {
+                        pass.set_pipeline(&overlay_pipeline.pipeline);
+                        pass.set_bind_group(0, &draw.bind_group, &[]);
+                        pass.draw(0..6, 0..1);
+                    }
                 }
             }
 
@@ -1070,14 +1063,16 @@ impl WgpuRenderer {
 
     /// Build per-quad GPU resources for the overlay: straight-RGBA subtitle planes
     /// (mode 0) plus libass alpha coverage bitmaps packed into one R8 atlas (mode 1).
-    fn prepare_overlay_draws(&self, frame: &OverlayFrame) -> Result<Vec<OverlayDraw>> {
+    fn prepare_overlay_draws(
+        &self,
+        frame: &OverlayFrame,
+        layout: VideoPresentationLayout,
+    ) -> Result<Vec<OverlayDraw>> {
         if self.overlay_pipeline.is_none() {
             return Err(PlayerError::Renderer(
                 "overlay pipeline not initialized".to_string(),
             ));
         }
-        let viewport_w = frame.viewport.width;
-        let viewport_h = frame.viewport.height;
         let mut draws = Vec::new();
 
         for plane in &frame.subtitle_planes {
@@ -1106,13 +1101,12 @@ impl WgpuRenderer {
                 plane.y,
                 plane.width,
                 plane.height,
-                viewport_w,
-                viewport_h,
+                layout,
             );
             draws.push(self.make_overlay_draw(&texture, uniforms));
         }
 
-        self.append_alpha_atlas_draws(frame, viewport_w, viewport_h, &mut draws)?;
+        self.append_alpha_atlas_draws(frame, layout, &mut draws)?;
         Ok(draws)
     }
 
@@ -1160,82 +1154,166 @@ impl WgpuRenderer {
     fn append_alpha_atlas_draws(
         &self,
         frame: &OverlayFrame,
-        viewport_w: u32,
-        viewport_h: u32,
+        layout: VideoPresentationLayout,
         draws: &mut Vec<OverlayDraw>,
     ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
-        let mut atlas_width = 0usize;
-        let mut atlas_height = 0usize;
-        for bitmap in bitmaps {
-            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
-                continue;
-            }
-            atlas_width += bitmap.placement.width as usize;
-            atlas_height = atlas_height.max(bitmap.placement.height as usize);
-        }
-        if atlas_width == 0 || atlas_height == 0 {
-            return Ok(());
-        }
+        let max_width = self.device.limits().max_texture_dimension_2d as usize;
 
-        let mut pixels = vec![0u8; atlas_width * atlas_height];
-        let mut cursor_x = 0usize;
-        let mut placements: Vec<(usize, usize)> = Vec::new();
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        let mut current_row_width = 0usize;
+        let mut current_row: Vec<usize> = Vec::new();
+
         for (index, bitmap) in bitmaps.iter().enumerate() {
-            let bw = bitmap.placement.width as usize;
-            let bh = bitmap.placement.height as usize;
-            if bw == 0 || bh == 0 {
+            if bitmap.placement.width == 0 || bitmap.placement.height == 0 || !bitmap.is_valid() {
                 continue;
             }
-            if !bitmap.is_valid() {
-                return Err(PlayerError::Renderer(format!(
-                    "overlay alpha bitmap has {} bytes, expected at least {} for {}x{} stride {}",
-                    bitmap.alpha.len(),
-                    bitmap.required_len(),
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    bitmap.stride
-                )));
+            let bw = bitmap.placement.width as usize;
+            if !current_row.is_empty() && current_row_width + bw > max_width {
+                rows.push(std::mem::take(&mut current_row));
+                current_row_width = 0;
             }
-            for row in 0..bh {
-                let src = row * bitmap.stride;
-                let dst = row * atlas_width + cursor_x;
-                pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
-            }
-            placements.push((index, cursor_x));
-            cursor_x += bw;
+            current_row.push(index);
+            current_row_width += bw;
+        }
+        if !current_row.is_empty() {
+            rows.push(current_row);
         }
 
-        let atlas = self.create_plane_texture(
-            "erika-wgpu-overlay-atlas",
-            atlas_width as u32,
-            atlas_height as u32,
-            wgpu::TextureFormat::R8Unorm,
-            &pixels,
-            atlas_width as u32,
-        );
-        for (index, atlas_x) in placements {
-            let bitmap = &bitmaps[index];
-            let uniforms = OverlayUniforms::alpha_atlas(
-                bitmap.color_rgba,
-                bitmap.placement.x,
-                bitmap.placement.y,
-                bitmap.placement.width,
-                bitmap.placement.height,
-                atlas_x as u32,
-                atlas_width as u32,
-                atlas_height as u32,
-                viewport_w,
-                viewport_h,
+        for row_indices in &rows {
+            let row_width: usize = row_indices
+                .iter()
+                .map(|i| bitmaps[*i].placement.width as usize)
+                .sum();
+            let row_height = row_indices
+                .iter()
+                .map(|i| bitmaps[*i].placement.height as usize)
+                .max()
+                .unwrap_or(0);
+            if row_width == 0 || row_height == 0 {
+                continue;
+            }
+
+            let mut pixels = vec![0u8; row_width * row_height];
+            let mut instances: Vec<DanmakuBatchInstance> = Vec::with_capacity(row_indices.len());
+
+            let mut cursor_x = 0usize;
+            for &index in row_indices {
+                let bitmap = &bitmaps[index];
+                let bw = bitmap.placement.width as usize;
+                let bh = bitmap.placement.height as usize;
+                for row in 0..bh {
+                    let src = row * bitmap.stride;
+                    let dst = row * row_width + cursor_x;
+                    pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
+                }
+
+                let color = crate::subtitle::AssColor::from_libass_rgba(bitmap.color_rgba);
+                let rect = layout.map_source_rect(
+                    bitmap.placement.x as f32,
+                    bitmap.placement.y as f32,
+                    bitmap.placement.width as f32,
+                    bitmap.placement.height as f32,
+                );
+                let aw = row_width.max(1) as f32;
+                let ah = row_height.max(1) as f32;
+                instances.push(DanmakuBatchInstance::new(
+                    rect,
+                    [
+                        cursor_x as f32 / aw,
+                        0.0,
+                        bitmap.placement.width as f32 / aw,
+                        bitmap.placement.height as f32 / ah,
+                    ],
+                    [
+                        f32::from(color.red) / 255.0,
+                        f32::from(color.green) / 255.0,
+                        f32::from(color.blue) / 255.0,
+                        f32::from(color.alpha) / 255.0,
+                    ],
+                ));
+                cursor_x += bw;
+            }
+
+            let texture = self.create_plane_texture(
+                "erika-wgpu-overlay-atlas",
+                row_width as u32,
+                row_height as u32,
+                wgpu::TextureFormat::R8Unorm,
+                &pixels,
+                row_width as u32,
             );
-            draws.push(self.make_overlay_draw(&atlas, uniforms));
+
+            let _pipeline = self
+                .overlay_pipeline
+                .as_ref()
+                .expect("overlay pipeline initialized");
+            let batch_pipeline = self
+                .danmaku_batch_pipeline
+                .as_ref()
+                .ok_or_else(|| PlayerError::Renderer("danmaku batch pipeline not initialized".to_string()))?;
+
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+            #[repr(C)]
+            #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+            struct BatchUniforms {
+                viewport: [f32; 2],
+            }
+            let batch_uniforms = BatchUniforms {
+                viewport: layout.overlay_viewport(),
+            };
+            let uniform_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("erika-wgpu-overlay-batch-uniforms"),
+                    contents: bytemuck::bytes_of(&batch_uniforms),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+            let instance_bytes = bytemuck::cast_slice(&instances);
+            let instance_buffer = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("erika-wgpu-overlay-batch-instances"),
+                    contents: instance_bytes,
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("erika-wgpu-overlay-batch-bgl"),
+                layout: &batch_pipeline.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: instance_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&batch_pipeline.sampler),
+                    },
+                ],
+            });
+
+            draws.push(OverlayDraw {
+                bind_group,
+                _texture: texture,
+                _uniform: uniform_buffer,
+                instance_count: instances.len() as u32,
+                use_batch_pipeline: true,
+            });
         }
         Ok(())
     }
 
-    /// Create the bind group (uniform + texture + sampler) for one overlay quad,
-    /// retaining the texture and uniform buffer alongside it. The overlay pipeline
-    /// must be initialized.
     fn make_overlay_draw(&self, texture: &wgpu::Texture, uniforms: OverlayUniforms) -> OverlayDraw {
         let pipeline = self
             .overlay_pipeline
@@ -1271,6 +1349,8 @@ impl WgpuRenderer {
             bind_group,
             _texture: texture.clone(),
             _uniform: uniform,
+            instance_count: 1,
+            use_batch_pipeline: false,
         }
     }
 
@@ -1535,6 +1615,7 @@ impl WgpuRenderer {
             sampler,
             format,
         });
+        self.ensure_danmaku_batch_pipeline(format);
     }
 
     fn ensure_danmaku_batch_pipeline(&mut self, format: wgpu::TextureFormat) {
@@ -2542,5 +2623,16 @@ mod tests {
         // Odd dimensions are rejected.
         let result = renderer.render_nv12_offscreen(3, 4, &[0u8; 12], &[0u8; 4], uniforms);
         assert!(matches!(result, Err(PlayerError::Renderer(_))));
+    }
+
+    #[test]
+    fn wgpu_overlay_uniforms_map_source_rect_into_presentation_layout() {
+        let layout = super::VideoPresentationLayout::aspect_fit(1920, 1080, 1000, 1000);
+        let uniforms = super::OverlayUniforms::rgba_plane(960, 540, 192, 108, layout);
+
+        assert_eq!(uniforms.viewport, [1000.0, 1000.0]);
+        for (actual, expected) in uniforms.rect.into_iter().zip([500.0, 500.0, 100.0, 56.25]) {
+            assert!((actual - expected).abs() < 0.001, "{actual} != {expected}");
+        }
     }
 }
