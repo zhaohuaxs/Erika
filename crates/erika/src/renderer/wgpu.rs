@@ -13,7 +13,6 @@ use crate::renderer::pipeline::{
     ColorRange, SourceColorState, TargetColorState, ToneMapOperator, VideoRenderPipeline,
 };
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WgpuRendererStats {
     pub surface_width: u32,
@@ -23,6 +22,12 @@ pub struct WgpuRendererStats {
     pub danmaku_passes: u64,
     pub danmaku_items: u64,
     pub attached: bool,
+    #[cfg(debug_assertions)]
+    pub overlay_gpu_ops: u32,
+    #[cfg(debug_assertions)]
+    pub overlay_cache_hits: u64,
+    #[cfg(debug_assertions)]
+    pub overlay_cache_misses: u64,
 }
 
 /// A clear color in the renderer's working space, components in `[0, 1]`.
@@ -216,6 +221,20 @@ fn overlay_has_planes(frame: &OverlayFrame) -> bool {
     !frame.subtitle_planes.is_empty() || !frame.subtitle_alpha_planes.is_empty()
 }
 
+#[inline]
+fn bytes_equal_fast(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    if a.len() <= 192 {
+        return a == b;
+    }
+    let mid = a.len() / 2;
+    a[..64] == b[..64]
+        && a[mid..mid + 64] == b[mid..mid + 64]
+        && a[a.len() - 64..] == b[b.len() - 64..]
+}
+
 /// Overlay quad uniforms, byte-compatible with the Metal `OverlayUniforms`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -250,7 +269,6 @@ impl OverlayUniforms {
     /// A libass alpha coverage bitmap sampled from a horizontal R8 atlas at `atlas_x`,
     /// tinted by `color_rgba` (mode 1). Mirrors the Metal `from_alpha_atlas_bitmap`.
     #[allow(clippy::too_many_arguments)]
-
     #[allow(dead_code)]
     fn alpha_atlas_rect(
         color: [f32; 4],
@@ -304,6 +322,22 @@ struct WgpuDanmakuAtlasCache {
     stride: usize,
     fill_texture: wgpu::Texture,
     outline_texture: wgpu::Texture,
+}
+
+#[allow(dead_code)]
+struct AlphaAtlasRowDescriptor {
+    width: u32,
+    height: u32,
+    bitmap_indices: Vec<usize>,
+}
+
+#[allow(dead_code)]
+struct WgpuOverlayAlphaAtlasCache {
+    draws: Vec<OverlayDraw>,
+    rows: Vec<AlphaAtlasRowDescriptor>,
+    row_textures: Vec<Option<wgpu::Texture>>,
+    row_uniforms: Vec<Option<wgpu::Buffer>>,
+    last_viewport: Option<[f32; 2]>,
 }
 
 impl WgpuDanmakuAtlasCache {
@@ -369,6 +403,13 @@ pub struct WgpuRenderer {
     danmaku_atlas_cache: Option<WgpuDanmakuAtlasCache>,
     danmaku_instance_buffer: Option<wgpu::Buffer>,
     danmaku_instance_buffer_len: usize,
+    danmaku_outline_signature: Option<Vec<u8>>,
+    danmaku_fill_signature: Option<Vec<u8>>,
+    danmaku_batch_uniform_buffer: Option<wgpu::Buffer>,
+    danmaku_batch_uniform_viewport: Option<[f32; 2]>,
+    overlay_alpha_atlas_cache: Option<WgpuOverlayAlphaAtlasCache>,
+    #[cfg(debug_assertions)]
+    overlay_render_start: Option<std::time::Instant>,
     supports_16bit_norm: bool,
     stats: WgpuRendererStats,
 }
@@ -433,6 +474,13 @@ impl WgpuRenderer {
             danmaku_batch_pipeline: None,
             danmaku_instance_buffer: None,
             danmaku_instance_buffer_len: 0,
+            danmaku_outline_signature: None,
+            danmaku_fill_signature: None,
+            danmaku_batch_uniform_buffer: None,
+            danmaku_batch_uniform_viewport: None,
+            overlay_alpha_atlas_cache: None,
+            #[cfg(debug_assertions)]
+            overlay_render_start: None,
             supports_16bit_norm,
             stats: WgpuRendererStats::default(),
         })
@@ -768,36 +816,44 @@ impl WgpuRenderer {
         danmaku: Option<&DanmakuRenderPlan>,
     ) -> Result<usize> {
         let danmaku_plan = danmaku.filter(|plan| !plan.is_empty());
-        let video = self
-            .current_video
-            .as_ref()
-            .ok_or_else(|| PlayerError::Renderer("no current video frame".to_string()))?;
+        let (luma_view, chroma_view, video_uniforms, video_width, video_height) = {
+            let video = self
+                .current_video
+                .as_ref()
+                .ok_or_else(|| PlayerError::Renderer("no current video frame".to_string()))?;
+            (
+                video.luma.clone(),
+                video.chroma.clone(),
+                video.uniforms,
+                video.width,
+                video.height,
+            )
+        };
         let pipeline = self
             .video_pipeline
             .as_ref()
             .ok_or_else(|| PlayerError::Renderer("video pipeline not initialized".to_string()))?;
-
-        let luma_view = &video.luma;
-        let chroma_view = &video.chroma;
+        let bind_group_layout = pipeline.bind_group_layout.clone();
+        let pipeline_ref = pipeline.pipeline.clone();
+        let pipeline_sampler = pipeline.sampler.clone();
 
         let surface_width = self.stats.surface_width.max(1);
         let surface_height = self.stats.surface_height.max(1);
         let layout = VideoPresentationLayout::aspect_fit(
-            video.width,
-            video.height,
+            video_width,
+            video_height,
             surface_width,
             surface_height,
         );
 
         let overlay_draws = match overlay {
             Some(frame) if overlay_has_planes(frame) => {
-
                 self.prepare_overlay_draws(frame, layout)?
             }
             _ => Vec::new(),
         };
 
-        let mut uniforms = video.uniforms;
+        let mut uniforms = video_uniforms;
         uniforms.rect = layout.target_rect;
         uniforms.viewport = layout.video_viewport();
 
@@ -810,7 +866,7 @@ impl WgpuRenderer {
             });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("erika-wgpu-video-bind-group"),
-            layout: &pipeline.bind_group_layout,
+            layout: &bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -826,7 +882,7 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+                    resource: wgpu::BindingResource::Sampler(&pipeline_sampler),
                 },
             ],
         });
@@ -853,7 +909,7 @@ impl WgpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&pipeline.pipeline);
+            pass.set_pipeline(&pipeline_ref);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.draw(0..6, 0..1);
         }
@@ -990,18 +1046,42 @@ impl WgpuRenderer {
         let batch_uniforms = DanmakuBatchUniforms {
             viewport: [viewport_w.max(1) as f32, viewport_h.max(1) as f32],
         };
-        let uniform_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("erika-wgpu-danmaku-batch-uniforms"),
-                contents: bytemuck::bytes_of(&batch_uniforms),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let viewport = batch_uniforms.viewport;
+        let uniform_buffer = if self.danmaku_batch_uniform_viewport == Some(viewport) {
+            self.danmaku_batch_uniform_buffer.clone().unwrap()
+        } else {
+            let buf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("erika-wgpu-danmaku-batch-uniforms"),
+                    contents: bytemuck::bytes_of(&batch_uniforms),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            self.danmaku_batch_uniform_buffer = Some(buf.clone());
+            self.danmaku_batch_uniform_viewport = Some(viewport);
+            buf
+        };
+
+        let outline_changed = self
+            .danmaku_outline_signature
+            .as_ref()
+            .map_or(true, |sig| !bytes_equal_fast(sig, outline_bytes));
+        let fill_changed = self
+            .danmaku_fill_signature
+            .as_ref()
+            .map_or(true, |sig| !bytes_equal_fast(sig, fill_bytes));
 
         pass.set_pipeline(&batch_pipeline.pipeline);
 
         if outline_count > 0 {
-            self.queue.write_buffer(instance_buffer, 0, outline_bytes);
+            if outline_changed {
+                self.queue.write_buffer(instance_buffer, 0, outline_bytes);
+                self.danmaku_outline_signature = Some(outline_bytes.to_vec());
+                #[cfg(debug_assertions)]
+                {
+                    self.stats.overlay_gpu_ops += 1;
+                }
+            }
             let outline_view = outline_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let outline_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("erika-wgpu-danmaku-outline-bgl"),
@@ -1030,7 +1110,14 @@ impl WgpuRenderer {
         }
 
         if fill_count > 0 {
-            self.queue.write_buffer(instance_buffer, 0, fill_bytes);
+            if fill_changed {
+                self.queue.write_buffer(instance_buffer, 0, fill_bytes);
+                self.danmaku_fill_signature = Some(fill_bytes.to_vec());
+                #[cfg(debug_assertions)]
+                {
+                    self.stats.overlay_gpu_ops += 1;
+                }
+            }
             let fill_view = fill_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let fill_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("erika-wgpu-danmaku-fill-bgl"),
@@ -1064,10 +1151,16 @@ impl WgpuRenderer {
     /// Build per-quad GPU resources for the overlay: straight-RGBA subtitle planes
     /// (mode 0) plus libass alpha coverage bitmaps packed into one R8 atlas (mode 1).
     fn prepare_overlay_draws(
-        &self,
+        &mut self,
         frame: &OverlayFrame,
         layout: VideoPresentationLayout,
     ) -> Result<Vec<OverlayDraw>> {
+        #[cfg(debug_assertions)]
+        {
+            self.overlay_render_start = Some(std::time::Instant::now());
+            self.stats.overlay_gpu_ops = 0;
+        }
+
         if self.overlay_pipeline.is_none() {
             return Err(PlayerError::Renderer(
                 "overlay pipeline not initialized".to_string(),
@@ -1096,20 +1189,81 @@ impl WgpuRenderer {
                 &plane.rgba,
                 plane.width * 4,
             );
-            let uniforms = OverlayUniforms::rgba_plane(
-                plane.x,
-                plane.y,
-                plane.width,
-                plane.height,
-                layout,
-            );
+            let uniforms =
+                OverlayUniforms::rgba_plane(plane.x, plane.y, plane.width, plane.height, layout);
             draws.push(self.make_overlay_draw(&texture, uniforms));
         }
 
-        self.append_alpha_atlas_draws(frame, layout, &mut draws)?;
+        if frame.subtitle_alpha_planes.is_empty() {
+            self.overlay_alpha_atlas_cache = None;
+            return Ok(draws);
+        }
+
+        if !frame.subtitle_changed {
+            if let Some(cache) = &self.overlay_alpha_atlas_cache {
+                #[cfg(debug_assertions)]
+                {
+                    self.stats.overlay_cache_hits += 1;
+                }
+                draws.extend(cache.draws.iter().map(|d| OverlayDraw {
+                    bind_group: d.bind_group.clone(),
+                    _texture: d._texture.clone(),
+                    _uniform: d._uniform.clone(),
+                    instance_count: d.instance_count,
+                    use_batch_pipeline: d.use_batch_pipeline,
+                }));
+                return Ok(draws);
+            }
+        }
+
+        let mut alpha_draws = Vec::new();
+        #[cfg(debug_assertions)]
+        {
+            self.stats.overlay_cache_misses += 1;
+        }
+        let row_descriptors = self.append_alpha_atlas_draws(frame, layout, &mut alpha_draws)?;
+        let row_texture_refs: Vec<Option<wgpu::Texture>> = alpha_draws
+            .iter()
+            .map(|d| Some(d._texture.clone()))
+            .collect();
+        let row_uniform_refs: Vec<Option<wgpu::Buffer>> = alpha_draws
+            .iter()
+            .map(|d| Some(d._uniform.clone()))
+            .collect();
+        self.overlay_alpha_atlas_cache = Some(WgpuOverlayAlphaAtlasCache {
+            draws: alpha_draws
+                .iter()
+                .map(|d| OverlayDraw {
+                    bind_group: d.bind_group.clone(),
+                    _texture: d._texture.clone(),
+                    _uniform: d._uniform.clone(),
+                    instance_count: d.instance_count,
+                    use_batch_pipeline: d.use_batch_pipeline,
+                })
+                .collect(),
+            rows: row_descriptors,
+            row_textures: row_texture_refs,
+            row_uniforms: row_uniform_refs,
+            last_viewport: Some(layout.overlay_viewport()),
+        });
+        draws.extend(alpha_draws);
+
+        #[cfg(debug_assertions)]
+        {
+            if let Some(start) = self.overlay_render_start.take() {
+                let elapsed = start.elapsed();
+                if elapsed > std::time::Duration::from_millis(2) {
+                    eprintln!(
+                        "Erika overlay render took {:.2}ms (gpu_ops={})",
+                        elapsed.as_secs_f64() * 1000.0,
+                        self.stats.overlay_gpu_ops,
+                    );
+                }
+            }
+        }
+
         Ok(draws)
     }
-
 
     fn prepare_danmaku_atlas_textures(
         &mut self,
@@ -1147,16 +1301,15 @@ impl WgpuRenderer {
         (fill_texture, outline_texture)
     }
 
-
     /// Pack libass alpha coverage bitmaps horizontally into one R8 atlas and add a
     /// mode-1 (coverage tinted by the bitmap's color) draw per placement. Mirrors the
     /// Metal `prepare_overlay_alpha_atlas` packing.
     fn append_alpha_atlas_draws(
-        &self,
+        &mut self,
         frame: &OverlayFrame,
         layout: VideoPresentationLayout,
         draws: &mut Vec<OverlayDraw>,
-    ) -> Result<()> {
+    ) -> Result<Vec<AlphaAtlasRowDescriptor>> {
         let bitmaps = &frame.subtitle_alpha_planes;
         let max_width = self.device.limits().max_texture_dimension_2d as usize;
 
@@ -1180,7 +1333,11 @@ impl WgpuRenderer {
             rows.push(current_row);
         }
 
-        for row_indices in &rows {
+        let mut row_descriptors: Vec<AlphaAtlasRowDescriptor> = Vec::with_capacity(rows.len());
+
+        let viewport = layout.overlay_viewport();
+
+        for (row_idx, row_indices) in rows.iter().enumerate() {
             let row_width: usize = row_indices
                 .iter()
                 .map(|i| bitmaps[*i].placement.width as usize)
@@ -1235,23 +1392,79 @@ impl WgpuRenderer {
                 cursor_x += bw;
             }
 
-            let texture = self.create_plane_texture(
-                "erika-wgpu-overlay-atlas",
-                row_width as u32,
-                row_height as u32,
-                wgpu::TextureFormat::R8Unorm,
-                &pixels,
-                row_width as u32,
-            );
+            let texture = if let Some(cache) = &self.overlay_alpha_atlas_cache {
+                if row_idx < cache.row_textures.len() {
+                    if let Some(cached_tex) = &cache.row_textures[row_idx] {
+                        let size = cached_tex.size();
+                        if size.width == row_width as u32 && size.height == row_height as u32 {
+                            self.queue.write_texture(
+                                wgpu::TexelCopyTextureInfo {
+                                    texture: cached_tex,
+                                    mip_level: 0,
+                                    origin: wgpu::Origin3d::ZERO,
+                                    aspect: wgpu::TextureAspect::All,
+                                },
+                                &pixels,
+                                wgpu::TexelCopyBufferLayout {
+                                    offset: 0,
+                                    bytes_per_row: Some(row_width as u32),
+                                    rows_per_image: Some(row_height as u32),
+                                },
+                                wgpu::Extent3d {
+                                    width: row_width as u32,
+                                    height: row_height as u32,
+                                    depth_or_array_layers: 1,
+                                },
+                            );
+                            cached_tex.clone()
+                        } else {
+                            self.create_plane_texture(
+                                "erika-wgpu-overlay-atlas",
+                                row_width as u32,
+                                row_height as u32,
+                                wgpu::TextureFormat::R8Unorm,
+                                &pixels,
+                                row_width as u32,
+                            )
+                        }
+                    } else {
+                        self.create_plane_texture(
+                            "erika-wgpu-overlay-atlas",
+                            row_width as u32,
+                            row_height as u32,
+                            wgpu::TextureFormat::R8Unorm,
+                            &pixels,
+                            row_width as u32,
+                        )
+                    }
+                } else {
+                    self.create_plane_texture(
+                        "erika-wgpu-overlay-atlas",
+                        row_width as u32,
+                        row_height as u32,
+                        wgpu::TextureFormat::R8Unorm,
+                        &pixels,
+                        row_width as u32,
+                    )
+                }
+            } else {
+                self.create_plane_texture(
+                    "erika-wgpu-overlay-atlas",
+                    row_width as u32,
+                    row_height as u32,
+                    wgpu::TextureFormat::R8Unorm,
+                    &pixels,
+                    row_width as u32,
+                )
+            };
 
             let _pipeline = self
                 .overlay_pipeline
                 .as_ref()
                 .expect("overlay pipeline initialized");
-            let batch_pipeline = self
-                .danmaku_batch_pipeline
-                .as_ref()
-                .ok_or_else(|| PlayerError::Renderer("danmaku batch pipeline not initialized".to_string()))?;
+            let batch_pipeline = self.danmaku_batch_pipeline.as_ref().ok_or_else(|| {
+                PlayerError::Renderer("danmaku batch pipeline not initialized".to_string())
+            })?;
 
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1260,25 +1473,46 @@ impl WgpuRenderer {
             struct BatchUniforms {
                 viewport: [f32; 2],
             }
-            let batch_uniforms = BatchUniforms {
-                viewport: layout.overlay_viewport(),
+            let batch_uniforms = BatchUniforms { viewport };
+            let uniform_buffer = if self
+                .overlay_alpha_atlas_cache
+                .as_ref()
+                .map_or(false, |c| c.last_viewport == Some(viewport))
+                && row_idx
+                    < self
+                        .overlay_alpha_atlas_cache
+                        .as_ref()
+                        .map_or(0, |c| c.row_uniforms.len())
+                && self
+                    .overlay_alpha_atlas_cache
+                    .as_ref()
+                    .and_then(|c| c.row_uniforms[row_idx].as_ref())
+                    .is_some()
+            {
+                self.overlay_alpha_atlas_cache
+                    .as_ref()
+                    .unwrap()
+                    .row_uniforms[row_idx]
+                    .as_ref()
+                    .unwrap()
+                    .clone()
+            } else {
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("erika-wgpu-overlay-batch-uniforms"),
+                        contents: bytemuck::bytes_of(&batch_uniforms),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    })
             };
-            let uniform_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("erika-wgpu-overlay-batch-uniforms"),
-                    contents: bytemuck::bytes_of(&batch_uniforms),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
 
             let instance_bytes = bytemuck::cast_slice(&instances);
-            let instance_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("erika-wgpu-overlay-batch-instances"),
-                    contents: instance_bytes,
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+            let instance_buffer =
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("erika-wgpu-overlay-batch-instances"),
+                        contents: instance_bytes,
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
 
             let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("erika-wgpu-overlay-batch-bgl"),
@@ -1310,8 +1544,14 @@ impl WgpuRenderer {
                 instance_count: instances.len() as u32,
                 use_batch_pipeline: true,
             });
+
+            row_descriptors.push(AlphaAtlasRowDescriptor {
+                width: row_width as u32,
+                height: row_height as u32,
+                bitmap_indices: row_indices.clone(),
+            });
         }
-        Ok(())
+        Ok(row_descriptors)
     }
 
     fn make_overlay_draw(&self, texture: &wgpu::Texture, uniforms: OverlayUniforms) -> OverlayDraw {
@@ -1742,7 +1982,8 @@ impl WgpuRenderer {
         if required_len == 0 {
             return;
         }
-        if self.danmaku_instance_buffer_len >= required_len && self.danmaku_instance_buffer.is_some()
+        if self.danmaku_instance_buffer_len >= required_len
+            && self.danmaku_instance_buffer.is_some()
         {
             return;
         }
@@ -1820,49 +2061,130 @@ impl WgpuRenderer {
     }
 
     #[cfg(target_os = "windows")]
-    fn try_upload_d3d11va_frame(
-        &mut self,
-        frame: &PlayerVideoFrame,
-    ) -> Result<Option<()>> {
+    fn try_upload_d3d11va_frame(&mut self, frame: &PlayerVideoFrame) -> Result<Option<()>> {
         let texture_ptr = match frame.frame.d3d11va_texture_ptr() {
             Some(ptr) => ptr,
             None => return Ok(None),
         };
 
-        let shared_info = match unsafe { crate::windows::get_d3d11_texture_shared_handle(texture_ptr) } {
+        let shared_info = match unsafe {
+            crate::windows::get_d3d11_texture_shared_handle(texture_ptr)
+        } {
             Ok(info) => info,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                eprintln!("d3d11va zerocopy: shared handle failed: {e}");
+                return Ok(None);
+            }
         };
 
         let width = frame.frame.width();
         let height = frame.frame.height();
 
+        let (wgpu_format, is_p010) = match d3d11va_wgpu_format(shared_info.format) {
+            Some(f) => f,
+            None => {
+                eprintln!(
+                    "d3d11va zerocopy: unsupported DXGI format {}",
+                    shared_info.format
+                );
+                return Ok(None);
+            }
+        };
+
+        if let result @ Ok(Some(())) =
+            self.try_d3d12_zerocopy(&shared_info, width, height, wgpu_format, is_p010, frame)
+        {
+            return result;
+        }
+
+        if let result @ Ok(Some(())) =
+            self.try_vulkan_zerocopy(&shared_info, width, height, wgpu_format, is_p010, frame)
+        {
+            return result;
+        }
+
+        eprintln!("d3d11va zerocopy: fallback to CPU readback");
+        Ok(None)
+    }
+
+    // wgpu 29.0.3 hal API 稳定性说明:
+    //
+    // 1. Device::as_hal::<A>() — 公开 API, #[cfg(wgpu_core)]
+    //    返回 Option<impl Deref<Target = A::Device>>
+    //    稳定性: 稳定 (wgpu 公开接口)
+    //
+    // 2. Device::create_texture_from_hal::<A>() — 公开 API, #[cfg(wgpu_core)], unsafe
+    //    稳定性: 稳定 (wgpu 公开接口), 但 unsafe 契约可能随版本变化
+    //
+    // 3. hal::dx12::Device::texture_from_raw() — hal 层 API
+    //    稳定性: 不稳定 (wgpu-hal 公开但非 wgpu 公开接口)
+    //    版本升级风险: 函数签名可能变化, 需重新验证
+    //
+    // 4. hal::dx12::Device::raw_device() — hal 层 API
+    //    稳定性: 不稳定 (返回 &ID3D12Device)
+    //
+    // 当 wgpu 版本升级时, 需重新评估以上 API 的兼容性
+    #[cfg(target_os = "windows")]
+    fn try_d3d12_zerocopy(
+        &mut self,
+        shared_handle: &crate::windows::D3d11SharedHandle,
+        width: u32,
+        height: u32,
+        wgpu_format: wgpu::TextureFormat,
+        is_p010: bool,
+        frame: &PlayerVideoFrame,
+    ) -> Result<Option<()>> {
+        if is_p010 && !self.supports_16bit_norm {
+            eprintln!(
+                "d3d11va zerocopy: P010 requires TEXTURE_FORMAT_16BIT_NORM, adapter lacks support"
+            );
+            return Ok(None);
+        }
+
+        // SAFETY: wgpu device 在调用期间存活, as_hal 返回的 guard 生命周期不超过 device
         let hal_device_guard = unsafe { self.device.as_hal::<wgpu::hal::dx12::Api>() };
         let hal_device = match hal_device_guard.as_deref() {
             Some(d) => d,
-            None => return Ok(None),
+            None => {
+                eprintln!("d3d11va zerocopy: D3D12 backend not available");
+                return Ok(None);
+            }
         };
 
+        // SAFETY: hal device guard 存活期间, raw_device 指针有效
         let d3d12_device = hal_device.raw_device();
+
+        let d3d12_luid = unsafe { d3d12_device.GetAdapterLuid() };
+        let src_luid = &shared_handle.adapter_luid;
+        if src_luid.LowPart != d3d12_luid.LowPart || src_luid.HighPart != d3d12_luid.HighPart {
+            eprintln!(
+                "d3d11va zerocopy: cross-adapter (D3D11 LUID={}:{}, D3D12 LUID={}:{}), skipping D3D12 path",
+                src_luid.LowPart, src_luid.HighPart,
+                d3d12_luid.LowPart, d3d12_luid.HighPart
+            );
+            return Ok(None);
+        }
 
         let d3d12_resource: windows::Win32::Graphics::Direct3D12::ID3D12Resource = unsafe {
             let mut result = None;
-            if d3d12_device
-                .OpenSharedHandle(shared_info.handle, &mut result)
-                .is_err()
-            {
+            if let Err(e) = d3d12_device.OpenSharedHandle(shared_handle.handle, &mut result) {
+                eprintln!("d3d11va zerocopy: D3D12 OpenSharedHandle failed: {e:?}");
                 return Ok(None);
             }
             match result {
                 Some(r) => r,
-                None => return Ok(None),
+                None => {
+                    eprintln!("d3d11va zerocopy: D3D12 OpenSharedHandle returned null");
+                    return Ok(None);
+                }
             }
         };
 
+        // SAFETY: ID3D12Resource 由 OpenSharedHandle 返回, 格式/尺寸与描述符一致
         let hal_texture = unsafe {
             wgpu::hal::dx12::Device::texture_from_raw(
                 d3d12_resource,
-                wgpu::TextureFormat::NV12,
+                wgpu_format,
                 wgpu::TextureDimension::D2,
                 wgpu::Extent3d {
                     width,
@@ -1874,11 +2196,12 @@ impl WgpuRenderer {
             )
         };
 
+        // SAFETY: hal Texture 由 texture_from_raw 正确构造, TextureDescriptor 与 hal Texture 描述一致
         let wgpu_texture = unsafe {
             self.device.create_texture_from_hal::<wgpu::hal::dx12::Api>(
                 hal_texture,
                 &wgpu::TextureDescriptor {
-                    label: Some("erika-wgpu-d3d11va-nv12"),
+                    label: Some("erika-wgpu-d3d11va-zerocopy"),
                     size: wgpu::Extent3d {
                         width,
                         height,
@@ -1887,21 +2210,15 @@ impl WgpuRenderer {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::NV12,
+                    format: wgpu_format,
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
             )
         };
 
-        let luma_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor {
-            aspect: wgpu::TextureAspect::Plane0,
-            ..wgpu::TextureViewDescriptor::default()
-        });
-        let chroma_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor {
-            aspect: wgpu::TextureAspect::Plane1,
-            ..wgpu::TextureViewDescriptor::default()
-        });
+        let (luma_view, chroma_view) =
+            create_d3d11va_views(&wgpu_texture, is_p010, self.supports_16bit_norm)?;
 
         let source = SourceColorState::new(
             frame.frame.color_primaries(),
@@ -1912,7 +2229,7 @@ impl WgpuRenderer {
         .hdr_metadata(frame.frame.hdr_metadata());
         let pipeline =
             VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
-        let uniforms = VideoUniforms::from_pipeline(&pipeline, false, false);
+        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
 
         self.current_video = Some(UploadedVideoFrame {
             luma: luma_view,
@@ -1922,8 +2239,179 @@ impl WgpuRenderer {
             uniforms,
         });
 
+        eprintln!("d3d11va zerocopy: D3D12 path selected");
         Ok(Some(()))
     }
+
+    // wgpu 29.0.3 hal API 稳定性说明:
+    //
+    // 1. Device::as_hal::<A>() — 公开 API, #[cfg(wgpu_core)]
+    //    稳定性: 稳定 (wgpu 公开接口)
+    //
+    // 2. Device::create_texture_from_hal::<A>() — 公开 API, #[cfg(wgpu_core)], unsafe
+    //    稳定性: 稳定 (wgpu 公开接口), 但 unsafe 契约可能随版本变化
+    //
+    // 3. hal::vulkan::Device::texture_from_d3d11_shared_handle() — hal 层 API, #[cfg(windows)]
+    //    稳定性: 不稳定 (wgpu-hal 29.0.3 新增)
+    //    版本升级风险: 函数签名可能变化, 参数可能调整
+    //
+    // 当 wgpu 版本升级时, 需重新评估以上 API 的兼容性
+    #[cfg(target_os = "windows")]
+    fn try_vulkan_zerocopy(
+        &mut self,
+        shared_handle: &crate::windows::D3d11SharedHandle,
+        width: u32,
+        height: u32,
+        wgpu_format: wgpu::TextureFormat,
+        is_p010: bool,
+        frame: &PlayerVideoFrame,
+    ) -> Result<Option<()>> {
+        if is_p010 && !self.supports_16bit_norm {
+            eprintln!(
+                "d3d11va zerocopy: P010 requires TEXTURE_FORMAT_16BIT_NORM, adapter lacks support"
+            );
+            return Ok(None);
+        }
+
+        if !self
+            .adapter
+            .features()
+            .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32)
+        {
+            eprintln!("d3d11va zerocopy: Vulkan backend lacks VULKAN_EXTERNAL_MEMORY_WIN32");
+            return Ok(None);
+        }
+
+        // SAFETY: wgpu device 在调用期间存活, as_hal 返回的 guard 生命周期不超过 device
+        let hal_device_guard = unsafe { self.device.as_hal::<wgpu::hal::vulkan::Api>() };
+        let hal_device = match hal_device_guard.as_deref() {
+            Some(d) => d,
+            None => {
+                eprintln!("d3d11va zerocopy: Vulkan hal device not available");
+                return Ok(None);
+            }
+        };
+
+        // SAFETY: handle 为有效 D3D11 共享句柄, Vulkan 设备支持 VK_KHR_external_memory_win32 扩展,
+        // 格式/尺寸与 D3D11 纹理一致
+        let hal_desc = wgpu::hal::TextureDescriptor {
+            label: Some("erika-wgpu-d3d11va-vulkan-zerocopy"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu_format,
+            usage: wgpu::TextureUses::RESOURCE,
+            memory_flags: wgpu::hal::MemoryFlags::empty(),
+            view_formats: vec![],
+        };
+        let hal_texture = match unsafe {
+            wgpu::hal::vulkan::Device::texture_from_d3d11_shared_handle(
+                hal_device,
+                shared_handle.handle,
+                &hal_desc,
+            )
+        } {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("d3d11va zerocopy: Vulkan texture_from_d3d11_shared_handle failed");
+                return Ok(None);
+            }
+        };
+
+        // SAFETY: hal Texture 由 texture_from_d3d11_shared_handle 正确构造,
+        // TextureDescriptor 与 hal Texture 描述一致
+        let wgpu_texture = unsafe {
+            self.device.create_texture_from_hal::<wgpu::hal::vulkan::Api>(
+                hal_texture,
+                &wgpu::TextureDescriptor {
+                    label: Some("erika-wgpu-d3d11va-vulkan-zerocopy"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu_format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+            )
+        };
+
+
+        let (luma_view, chroma_view) =
+            create_d3d11va_views(&wgpu_texture, is_p010, self.supports_16bit_norm)?;
+
+        let source = SourceColorState::new(
+            frame.frame.color_primaries(),
+            frame.frame.transfer_function(),
+        )
+        .range(frame.frame.color_range())
+        .matrix(frame.frame.matrix_coefficients())
+        .hdr_metadata(frame.frame.hdr_metadata());
+        let pipeline =
+            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+
+        self.current_video = Some(UploadedVideoFrame {
+            luma: luma_view,
+            chroma: chroma_view,
+            width,
+            height,
+            uniforms,
+        });
+
+        eprintln!("d3d11va zerocopy: Vulkan path selected");
+        Ok(Some(()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn d3d11va_wgpu_format(dxgi_format: i32) -> Option<(wgpu::TextureFormat, bool)> {
+    match dxgi_format {
+        87 => Some((wgpu::TextureFormat::NV12, false)),
+        89 | 103 => Some((wgpu::TextureFormat::NV12, true)),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn create_d3d11va_views(
+    texture: &wgpu::Texture,
+    is_p010: bool,
+    supports_16bit_norm: bool,
+) -> Result<(wgpu::TextureView, wgpu::TextureView)> {
+    if is_p010 && !supports_16bit_norm {
+        return Err(PlayerError::Renderer(
+            "P010 requires TEXTURE_FORMAT_16BIT_NORM, adapter lacks support".to_string(),
+        ));
+    }
+
+    let (luma_format, chroma_format) = if is_p010 {
+        (Some(wgpu::TextureFormat::R16Unorm), Some(wgpu::TextureFormat::Rg16Unorm))
+    } else {
+        (None, None)
+    };
+
+    let luma_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        aspect: wgpu::TextureAspect::Plane0,
+        format: luma_format,
+        ..Default::default()
+    });
+    let chroma_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        aspect: wgpu::TextureAspect::Plane1,
+        format: chroma_format,
+        ..Default::default()
+    });
+
+    Ok((luma_view, chroma_view))
 }
 
 fn scaled_surface_size(width: u32, height: u32, scale: f64) -> (u32, u32) {
@@ -2136,24 +2624,20 @@ impl RendererBackend for WgpuRenderer {
 
         let planar = frame_ref.to_planar_frame().ok_or_else(|| {
             PlayerError::Renderer(
-                "wgpu: frame is not software 4:2:0 8-bit/10-bit (unsupported format)"
-                    .to_string(),
+                "wgpu: frame is not software 4:2:0 8-bit/10-bit (unsupported format)".to_string(),
             )
         })?;
         let is_p010 = matches!(planar.format, PlanarPixelFormat::P010);
-        let source = SourceColorState::new(
-            frame_ref.color_primaries(),
-            frame_ref.transfer_function(),
-        )
-        .range(frame_ref.color_range())
-        .matrix(frame_ref.matrix_coefficients())
-        .hdr_metadata(frame_ref.hdr_metadata());
+        let source =
+            SourceColorState::new(frame_ref.color_primaries(), frame_ref.transfer_function())
+                .range(frame_ref.color_range())
+                .matrix(frame_ref.matrix_coefficients())
+                .hdr_metadata(frame_ref.hdr_metadata());
         let pipeline =
             VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
         let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
         self.upload_planar_with_context(planar, uniforms)
     }
-
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
         if self.current_video.is_none() {
@@ -2200,6 +2684,19 @@ impl RendererBackend for WgpuRenderer {
             self.stats.danmaku_passes += 1;
             self.stats.danmaku_items += danmaku_draws as u64;
         }
+
+        #[cfg(debug_assertions)]
+        {
+            let total = self.stats.overlay_cache_hits + self.stats.overlay_cache_misses;
+            if total > 0 && total % 300 == 0 {
+                let hit_rate = self.stats.overlay_cache_hits as f64 / total as f64 * 100.0;
+                eprintln!(
+                    "Erika overlay cache stats: hit_rate={:.1}%, hits={}, misses={}",
+                    hit_rate, self.stats.overlay_cache_hits, self.stats.overlay_cache_misses,
+                );
+            }
+        }
+
         Ok(true)
     }
 
@@ -2318,21 +2815,17 @@ mod tests {
 
         let draws = renderer.prepare_danmaku_draws(&plan).unwrap();
         assert_eq!(draws.len(), 2);
-        assert!(
-            renderer
-                .danmaku_atlas_cache
-                .as_ref()
-                .is_some_and(|cache| cache.can_reuse_for(&atlas))
-        );
+        assert!(renderer
+            .danmaku_atlas_cache
+            .as_ref()
+            .is_some_and(|cache| cache.can_reuse_for(&atlas)));
 
         let cached_draws = renderer.prepare_danmaku_draws(&plan).unwrap();
         assert_eq!(cached_draws.len(), 2);
-        assert!(
-            renderer
-                .danmaku_atlas_cache
-                .as_ref()
-                .is_some_and(|cache| cache.can_reuse_for(&atlas))
-        );
+        assert!(renderer
+            .danmaku_atlas_cache
+            .as_ref()
+            .is_some_and(|cache| cache.can_reuse_for(&atlas)));
     }
 
     #[test]
@@ -2557,11 +3050,9 @@ mod tests {
         // wgpu renderer is object-safe through the trait and reports no current frame
         // so the presenter falls back to a test frame.
         let backend: &mut dyn RendererBackend = &mut renderer;
-        assert!(
-            !backend
-                .render_current_frame(RenderFrameContext::new(Duration::ZERO, 1))
-                .unwrap()
-        );
+        assert!(!backend
+            .render_current_frame(RenderFrameContext::new(Duration::ZERO, 1))
+            .unwrap());
     }
 
     #[test]

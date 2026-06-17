@@ -21,24 +21,20 @@ use crate::core::{
     RendererRuntimeStats, TrackInfo, TrackSelection,
 };
 use crate::danmaku::{
-    DANMAKU_DEBUG_BUCKETS, DanmakuDebugBucket, DanmakuLayoutConfig, DanmakuPreparedStats,
-    DanmakuRenderPlan, DanmakuSession, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
-    DanmakuViewport, DfmLayoutEngine,
+    DanmakuDebugBucket, DanmakuLayoutConfig, DanmakuPreparedStats, DanmakuRenderPlan,
+    DanmakuSession, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource, DanmakuViewport,
+    DfmLayoutEngine, DANMAKU_DEBUG_BUCKETS,
 };
 use crate::overlay::{OverlayFrame, OverlayTimeline, OverlayViewport};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use crate::renderer::metal::{MetalRenderer, MetalRendererConfig};
 
-#[cfg(feature = "libass")]
-use crate::subtitle::decoded_subtitle_frames_to_ass_script;
 use crate::subtitle::{
-    DecodedSubtitleFrame, SubtitleRendererCore, SubtitleTrackConfig, SubtitleViewport,
-    decoded_subtitle_frames_to_timeline,
+    decoded_subtitle_frames_to_timeline, DecodedSubtitleFrame, SubtitleRendererCore,
+    SubtitleTrackConfig, SubtitleViewport,
 };
 #[cfg(feature = "libass")]
-use crate::subtitle::{
-    LibassRenderConfig, LibassSubtitleRenderer, SubtitleRenderRequest, SubtitleRenderer,
-};
+use crate::subtitle::{LibassSubtitleRenderer, SubtitleRenderer};
 use crate::trace;
 use crate::{PlayerError, Result};
 
@@ -107,7 +103,10 @@ impl Default for PresenterConfig {
     }
 }
 
-#[cfg(any(target_os = "windows", not(any(target_os = "macos", target_os = "ios"))))]
+#[cfg(any(
+    target_os = "windows",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 #[derive(Debug, Clone, Default)]
 pub struct WgpuRendererConfig {}
 
@@ -1282,8 +1281,8 @@ impl SubtitleFrameState {
             .map(|frame| frame.frame.clone())
             .collect::<Vec<_>>();
         if !text_frames.is_empty() {
-            self.append_text_subtitles(pts, overlay, &text_frames);
-            subtitle_changed = true;
+            let changed = self.append_text_subtitles(pts, overlay, &text_frames);
+            subtitle_changed = subtitle_changed || changed;
         }
 
         overlay.subtitle_changed |= subtitle_changed;
@@ -1295,13 +1294,20 @@ impl SubtitleFrameState {
         pts: Duration,
         overlay: &mut OverlayFrame,
         frames: &[DecodedSubtitleFrame],
-    ) {
-        match self.text_renderer.render_alpha(pts, overlay.viewport, frames) {
-            Ok(Some(bitmaps)) => overlay.subtitle_alpha_planes.extend(bitmaps.parts),
-            Ok(None) => {}
+    ) -> bool {
+        match self
+            .text_renderer
+            .render_alpha(pts, overlay.viewport, frames)
+        {
+            Ok(Some(bitmaps)) => {
+                overlay.subtitle_alpha_planes.extend(bitmaps.parts);
+                bitmaps.changed
+            }
+            Ok(None) => false,
             Err(error) => {
                 eprintln!("Erika presenter text subtitle render failed: {error}");
                 append_text_subtitles_debug(pts, overlay, frames);
+                true
             }
         }
     }
@@ -1312,45 +1318,114 @@ impl SubtitleFrameState {
         pts: Duration,
         overlay: &mut OverlayFrame,
         frames: &[DecodedSubtitleFrame],
-    ) {
+    ) -> bool {
         append_text_subtitles_debug(pts, overlay, frames);
+        true
     }
 }
 
 #[cfg(feature = "libass")]
 #[derive(Debug, Default)]
 struct CachedLibassTextRenderer {
-    script: Option<String>,
+    seen_count: usize,
     renderer: Option<LibassSubtitleRenderer>,
+    event_fingerprint: Vec<(i64, i64, u64)>,
 }
 
 #[cfg(feature = "libass")]
 impl CachedLibassTextRenderer {
+    fn simple_hash(s: &str) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for byte in s.bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash
+    }
+
+    fn prepare_chunk(text: &str, event_index: usize) -> String {
+        let text = text.trim();
+        let fields: Vec<&str> = text.splitn(2, ',').collect();
+        if fields.len() == 2 && fields[0].trim().parse::<i64>().is_ok() {
+            let mut result = event_index.to_string();
+            result.push(',');
+            result.push_str(fields[1]);
+            result
+        } else {
+            let mut result = event_index.to_string();
+            result.push(',');
+            result.push_str(text);
+            result
+        }
+    }
+
     fn render_alpha(
         &mut self,
         pts: Duration,
         viewport: OverlayViewport,
         frames: &[DecodedSubtitleFrame],
     ) -> crate::subtitle::Result<Option<crate::subtitle::SubtitleBitmapSet>> {
-        let fallback_end = pts.saturating_add(Duration::from_secs(24 * 60 * 60));
-        let Some(script) = decoded_subtitle_frames_to_ass_script(frames.iter(), fallback_end)
-        else {
-            self.script = None;
+        let total_events: usize = frames.iter().map(|f| f.text.len()).sum();
+
+        let current_fingerprint: Vec<(i64, i64, u64)> = frames
+            .iter()
+            .flat_map(|f| {
+                f.text.iter().map(|seg| {
+                    let start_ms = f.start.unwrap_or(Duration::ZERO).as_millis() as i64;
+                    let text_hash = Self::simple_hash(&seg.text);
+                    (f.track_id, start_ms, text_hash)
+                })
+            })
+            .collect();
+
+        let is_append_only = current_fingerprint.len() >= self.event_fingerprint.len()
+            && current_fingerprint[..self.event_fingerprint.len()] == self.event_fingerprint[..];
+
+        if !is_append_only && !self.event_fingerprint.is_empty() {
             self.renderer = None;
-            return Ok(None);
-        };
-        if self.script.as_ref() != Some(&script) {
-            self.renderer = Some(LibassSubtitleRenderer::from_ass_script(
-                script.as_bytes(),
-                LibassRenderConfig::default(),
-            )?);
-            self.script = Some(script);
+            self.seen_count = 0;
         }
 
-        let Some(renderer) = self.renderer.as_mut() else {
-            return Ok(None);
-        };
-        let output = renderer.render(SubtitleRenderRequest::new(
+        self.event_fingerprint = current_fingerprint;
+
+        if self.renderer.is_none() {
+            if total_events == 0 {
+                return Ok(None);
+            }
+            self.renderer = Some(crate::subtitle::LibassSubtitleRenderer::from_ass_script(
+                crate::subtitle::DEFAULT_ASS_SCRIPT_HEADER.as_bytes(),
+                crate::subtitle::LibassRenderConfig::default(),
+            )?);
+            self.seen_count = 0;
+        }
+
+        let renderer = self.renderer.as_mut().unwrap();
+
+        if total_events > self.seen_count {
+            let mut event_index = 0usize;
+            for frame in frames {
+                for seg in &frame.text {
+                    if event_index >= self.seen_count {
+                        let start = frame.start.unwrap_or(Duration::ZERO);
+                        let end = frame
+                            .end
+                            .unwrap_or(start.saturating_add(Duration::from_secs(10)));
+                        let timecode_ms = start.as_millis() as i64;
+                        let duration_ms = end.saturating_sub(start).as_millis() as i64;
+
+                        let chunk = Self::prepare_chunk(seg.text.trim_end(), event_index);
+
+                        unsafe {
+                            renderer.process_chunk(chunk.as_bytes(), timecode_ms, duration_ms);
+                        }
+                    }
+                    event_index += 1;
+                }
+            }
+            self.seen_count = total_events;
+        }
+
+        let output = renderer.render(crate::subtitle::SubtitleRenderRequest::new(
             pts,
             viewport.width,
             viewport.height,
@@ -1542,9 +1617,7 @@ mod tests {
 
         state.append_to_overlay(Duration::from_secs(2), &mut overlay);
 
-        assert!(
-            !overlay.subtitle_planes.is_empty() || !overlay.subtitle_alpha_planes.is_empty()
-        );
+        assert!(!overlay.subtitle_planes.is_empty() || !overlay.subtitle_alpha_planes.is_empty());
         assert!(overlay.subtitle_changed);
     }
 
@@ -1692,11 +1765,10 @@ mod tests {
             1,
         );
         assert!(plan.items.iter().any(|item| item.item_id >> 48 == first_id));
-        assert!(
-            plan.items
-                .iter()
-                .any(|item| item.item_id >> 48 == second_id)
-        );
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.item_id >> 48 == second_id));
 
         assert!(presenter.set_danmaku_track_enabled(first_id, false));
         let plan = presenter.danmaku.render_plan(
@@ -1705,11 +1777,10 @@ mod tests {
             2,
         );
         assert!(!plan.items.iter().any(|item| item.item_id >> 48 == first_id));
-        assert!(
-            plan.items
-                .iter()
-                .any(|item| item.item_id >> 48 == second_id)
-        );
+        assert!(plan
+            .items
+            .iter()
+            .any(|item| item.item_id >> 48 == second_id));
 
         assert!(presenter.remove_danmaku_track(second_id));
         assert_eq!(presenter.danmaku_tracks().len(), 1);

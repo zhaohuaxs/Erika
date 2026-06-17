@@ -502,6 +502,7 @@ mod libass_ffi {
         pub fn ass_library_done(library: *mut AssLibrary);
         pub fn ass_renderer_init(library: *mut AssLibrary) -> *mut AssRenderer;
         pub fn ass_renderer_done(renderer: *mut AssRenderer);
+
         pub fn ass_set_frame_size(renderer: *mut AssRenderer, width: c_int, height: c_int);
         pub fn ass_set_storage_size(renderer: *mut AssRenderer, width: c_int, height: c_int);
         pub fn ass_set_fonts(
@@ -523,6 +524,14 @@ mod libass_ffi {
             buffer_size: size_t,
             codepage: *const c_char,
         ) -> *mut AssTrack;
+
+        pub fn ass_process_chunk(
+            track: *mut AssTrack,
+            data: *mut c_char,
+            size: size_t,
+            timecode: c_longlong,
+            duration: c_longlong,
+        );
         pub fn ass_free_track(track: *mut AssTrack);
         pub fn ass_render_frame(
             renderer: *mut AssRenderer,
@@ -655,6 +664,55 @@ impl LibassSubtitleRenderer {
                 config,
             })
         }
+    }
+
+    pub fn replace_track(&mut self, script: impl AsRef<[u8]>) -> Result<()> {
+        let script = script.as_ref();
+        if script.is_empty() {
+            return Err(SubtitleError::Libass("ASS script is empty".to_string()));
+        }
+        let mut script = script.to_vec();
+        unsafe {
+            let Some(new_track) = NonNull::new(libass_ffi::ass_read_memory(
+                self.library.as_ptr(),
+                script.as_mut_ptr().cast(),
+                script.len(),
+                std::ptr::null(),
+            )) else {
+                return Err(SubtitleError::Libass(
+                    "failed to parse ASS script with libass".to_string(),
+                ));
+            };
+            libass_ffi::ass_free_track(self.track.as_ptr());
+            self.track = new_track;
+        }
+        Ok(())
+    }
+
+    pub unsafe fn process_chunk(
+        &mut self,
+        data: &[u8],
+        timecode_ms: i64,
+        duration_ms: i64,
+    ) {
+        let mut data = data.to_vec();
+        unsafe {
+            libass_ffi::ass_process_chunk(
+                self.track.as_ptr(),
+                data.as_mut_ptr().cast(),
+                data.len(),
+                timecode_ms,
+                duration_ms,
+            );
+        }
+    }
+
+    pub fn track_ptr(&self) -> *mut libass_ffi::AssTrack {
+        self.track.as_ptr()
+    }
+
+    pub fn renderer_ptr(&self) -> *mut libass_ffi::AssRenderer {
+        self.renderer.as_ptr()
     }
 
     pub fn config(&self) -> LibassRenderConfig {
@@ -1318,7 +1376,7 @@ fn push_ass_dialogue(output: &mut String, start: Duration, end: Duration, text: 
     output.push('\n');
 }
 
-fn format_ass_timestamp(value: Duration) -> String {
+pub fn format_ass_timestamp(value: Duration) -> String {
     let centiseconds = value.as_millis().saturating_add(5) / 10;
     let seconds_total = centiseconds / 100;
     let hours = seconds_total / 3600;
@@ -1342,7 +1400,7 @@ fn escape_ass_text(value: &str) -> String {
     output
 }
 
-const DEFAULT_ASS_SCRIPT_HEADER: &str = r#"[Script Info]
+pub const DEFAULT_ASS_SCRIPT_HEADER: &str = r#"[Script Info]
 ScriptType: v4.00+
 PlayResX: 1920
 PlayResY: 1080

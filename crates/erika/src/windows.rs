@@ -3,10 +3,12 @@ use std::sync::Mutex;
 
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11Resource, ID3D11Texture2D, D3D11_RESOURCE_MISC_SHARED,
-    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
 };
-use windows::Win32::Graphics::Dxgi::IDXGIResource;
-use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_SHARED_RESOURCE_READ, IDXGIResource, IDXGIResource1,
+};
+use windows::Win32::Foundation::{HANDLE, LUID};
 use windows::core::Interface;
 
 pub struct D3d11SharedHandle {
@@ -14,6 +16,7 @@ pub struct D3d11SharedHandle {
     pub width: u32,
     pub height: u32,
     pub format: i32,
+    pub adapter_luid: LUID,
 }
 
 struct SharedTextureCache {
@@ -21,6 +24,7 @@ struct SharedTextureCache {
     width: u32,
     height: u32,
     format: i32,
+    nthandle: bool,
 }
 
 static SHARED_TEXTURE_CACHE: Mutex<Option<SharedTextureCache>> = Mutex::new(None);
@@ -48,15 +52,69 @@ pub unsafe fn get_d3d11_texture_shared_handle(
         }
     };
 
+    let adapter_luid = unsafe { get_d3d11_adapter_luid(&texture) };
+    eprintln!(
+        "d3d11va shared handle: D3D11 adapter LUID = {}:{}",
+        adapter_luid.LowPart, adapter_luid.HighPart
+    );
+
+    let dxgi_resource1: Option<IDXGIResource1> = dxgi_resource.cast().ok();
+
+    if let Some(r1) = dxgi_resource1 {
+        match unsafe {
+            r1.CreateSharedHandle(
+                None,
+                DXGI_SHARED_RESOURCE_READ.0 as u32,
+                windows::core::PCWSTR::null(),
+            )
+        } {
+            Ok(handle) => {
+                eprintln!("d3d11va shared handle: direct path (NT handle)");
+                return Ok(D3d11SharedHandle {
+                    handle,
+                    width: desc.Width,
+                    height: desc.Height,
+                    format: desc.Format.0,
+                    adapter_luid,
+                });
+            }
+            Err(e) => {
+                eprintln!("d3d11va shared handle: direct IDXGIResource1::CreateSharedHandle failed: {e:?}");
+            }
+        }
+    }
+
     match unsafe { dxgi_resource.GetSharedHandle() } {
-        Ok(handle) => Ok(D3d11SharedHandle {
-            handle,
-            width: desc.Width,
-            height: desc.Height,
-            format: desc.Format.0,
-        }),
+        Ok(handle) => {
+            eprintln!("d3d11va shared handle: direct path (kernel handle)");
+            Ok(D3d11SharedHandle {
+                handle,
+                width: desc.Width,
+                height: desc.Height,
+                format: desc.Format.0,
+                adapter_luid,
+            })
+        }
         Err(_) => unsafe { create_shared_copy_and_get_handle(&texture, &desc) },
     }
+}
+
+unsafe fn get_d3d11_adapter_luid(texture: &ID3D11Texture2D) -> LUID {
+    let device = match unsafe { texture.GetDevice() } {
+        Ok(d) => d,
+        Err(_) => return LUID::default(),
+    };
+    let dxgi_device: Result<windows::Win32::Graphics::Dxgi::IDXGIDevice, _> = device.cast();
+    if let Ok(dxgi_dev) = dxgi_device {
+        let adapter = unsafe { dxgi_dev.GetAdapter() };
+        if let Ok(adapter) = adapter {
+            let desc = unsafe { adapter.GetDesc() };
+            if let Ok(desc) = desc {
+                return desc.AdapterLuid;
+            }
+        }
+    }
+    LUID::default()
 }
 
 unsafe fn create_shared_copy_and_get_handle(
@@ -65,6 +123,8 @@ unsafe fn create_shared_copy_and_get_handle(
 ) -> Result<D3d11SharedHandle, String> {
     let device: ID3D11Device = unsafe { src_texture.GetDevice() }
         .map_err(|e| format!("failed to get ID3D11Device from texture: {e}"))?;
+
+    let adapter_luid = unsafe { get_d3d11_adapter_luid(src_texture) };
 
     let ctx = unsafe { device.GetImmediateContext() }
         .map_err(|e| format!("failed to get immediate context: {e}"))?;
@@ -79,11 +139,13 @@ unsafe fn create_shared_copy_and_get_handle(
                 || c.height != src_desc.Height
                 || c.format != src_desc.Format.0
                 || c.texture.is_none()
+                || !c.nthandle
         }
         None => true,
     };
 
     if needs_new {
+        eprintln!("d3d11va shared handle: staging cache miss, creating new texture (SHARED | SHARED_NTHANDLE)");
         let shared_desc = D3D11_TEXTURE2D_DESC {
             Width: src_desc.Width,
             Height: src_desc.Height,
@@ -94,7 +156,7 @@ unsafe fn create_shared_copy_and_get_handle(
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: 0,
             CPUAccessFlags: 0,
-            MiscFlags: D3D11_RESOURCE_MISC_SHARED.0 as u32,
+            MiscFlags: (D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE).0 as u32,
         };
 
         let shared_texture: ID3D11Texture2D = unsafe {
@@ -110,6 +172,7 @@ unsafe fn create_shared_copy_and_get_handle(
             width: src_desc.Width,
             height: src_desc.Height,
             format: src_desc.Format.0,
+            nthandle: true,
         });
     }
 
@@ -117,6 +180,11 @@ unsafe fn create_shared_copy_and_get_handle(
         .as_ref()
         .and_then(|c| c.texture.as_ref())
         .ok_or_else(|| "no shared texture in cache".to_string())?;
+
+    if !needs_new {
+        eprintln!("d3d11va shared handle: staging cache hit");
+    }
+    eprintln!("d3d11va shared handle: CopySubresourceRegion staging path");
 
     unsafe {
         ctx.CopySubresourceRegion(
@@ -135,17 +203,53 @@ unsafe fn create_shared_copy_and_get_handle(
         .cast()
         .map_err(|e| format!("cast shared texture to ID3D11Resource: {e}"))?;
 
-    let dxgi_resource: IDXGIResource = resource
-        .cast()
-        .map_err(|e| format!("cast to IDXGIResource: {e}"))?;
+    let dxgi_resource1: IDXGIResource1 = match resource.cast() {
+        Ok(r1) => r1,
+        Err(e) => {
+            eprintln!("d3d11va shared handle: cast to IDXGIResource1 failed: {e}");
+            let dxgi_resource: IDXGIResource = resource
+                .cast()
+                .map_err(|e2| format!("cast to IDXGIResource also failed: {e2}"))?;
+            let handle = unsafe { dxgi_resource.GetSharedHandle() }
+                .map_err(|e2| format!("GetSharedHandle failed: {e2}"))?;
+            return Ok(D3d11SharedHandle {
+                handle,
+                width: src_desc.Width,
+                height: src_desc.Height,
+                format: src_desc.Format.0,
+                adapter_luid,
+            });
+        }
+    };
 
-    let handle = unsafe { dxgi_resource.GetSharedHandle() }
-        .map_err(|e| format!("GetSharedHandle on shared copy: {e}"))?;
-
-    Ok(D3d11SharedHandle {
-        handle,
-        width: src_desc.Width,
-        height: src_desc.Height,
-        format: src_desc.Format.0,
-    })
+    match unsafe {
+        dxgi_resource1.CreateSharedHandle(
+            None,
+            DXGI_SHARED_RESOURCE_READ.0 as u32,
+            windows::core::PCWSTR::null(),
+        )
+    } {
+        Ok(handle) => Ok(D3d11SharedHandle {
+            handle,
+            width: src_desc.Width,
+            height: src_desc.Height,
+            format: src_desc.Format.0,
+            adapter_luid,
+        }),
+        Err(e) => {
+            eprintln!("d3d11va shared handle: CreateSharedHandle failed: {e:?}, falling back to GetSharedHandle");
+            let dxgi_resource: IDXGIResource = resource
+                .cast()
+                .map_err(|e2| format!("cast to IDXGIResource failed: {e2}"))?;
+            let handle = unsafe { dxgi_resource.GetSharedHandle() }
+                .map_err(|e2| format!("GetSharedHandle also failed: {e2}"))?;
+            Ok(D3d11SharedHandle {
+                handle,
+                width: src_desc.Width,
+                height: src_desc.Height,
+                format: src_desc.Format.0,
+                adapter_luid,
+            })
+        }
+    }
 }

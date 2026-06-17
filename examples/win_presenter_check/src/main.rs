@@ -77,9 +77,7 @@ fn main() {
     if let Some(ref path) = danmaku_path {
         match DanmakuTimeline::from_file(path) {
             Ok(timeline) => {
-                let item_count = timeline.items().len();
                 presenter.set_danmaku_timeline(timeline);
-                eprintln!("loaded danmaku: {path} ({item_count} items)");
             }
             Err(e) => {
                 eprintln!("failed to load danmaku {path}: {e}");
@@ -88,9 +86,8 @@ fn main() {
     }
 
     if let Some(path) = args.next() {
-        match presenter.add_external_subtitle(&path) {
-            Ok(track) => eprintln!("added subtitle track #{}: {path}", track.id),
-            Err(e) => eprintln!("failed to add subtitle {path}: {e}"),
+        if let Err(e) = presenter.add_external_subtitle(&path) {
+            eprintln!("failed to add subtitle {path}: {e}");
         }
     }
 
@@ -99,7 +96,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    eprintln!("playing: {uri}");
+
     let start = Instant::now();
     let mut msg = MSG::default();
     let mut running = true;
@@ -133,6 +130,7 @@ fn main() {
         let fps_elapsed = fps_timer.elapsed().as_secs_f64();
         if fps_elapsed >= 1.0 {
             display_fps = fps_frame_count as f64 / fps_elapsed;
+
             fps_frame_count = 0;
             fps_timer = Instant::now();
         }
@@ -178,7 +176,7 @@ fn main() {
     }
 
     let _ = presenter.stop();
-    eprintln!("done");
+
 }
 
 fn create_window(width: i32, height: i32) -> HWND {
