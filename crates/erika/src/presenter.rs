@@ -1305,7 +1305,7 @@ impl SubtitleFrameState {
             }
             Ok(None) => false,
             Err(error) => {
-                eprintln!("Erika presenter text subtitle render failed: {error}");
+                eprintln!("Erika presenter text subtitle render failed, falling back to debug renderer: {error}");
                 append_text_subtitles_debug(pts, overlay, frames);
                 true
             }
@@ -1330,6 +1330,7 @@ struct CachedLibassTextRenderer {
     seen_count: usize,
     renderer: Option<LibassSubtitleRenderer>,
     event_fingerprint: Vec<(i64, i64, u64)>,
+    init_failed: bool,
 }
 
 #[cfg(feature = "libass")]
@@ -1384,6 +1385,7 @@ impl CachedLibassTextRenderer {
         if !is_append_only && !self.event_fingerprint.is_empty() {
             self.renderer = None;
             self.seen_count = 0;
+            self.init_failed = false;
         }
 
         self.event_fingerprint = current_fingerprint;
@@ -1392,11 +1394,27 @@ impl CachedLibassTextRenderer {
             if total_events == 0 {
                 return Ok(None);
             }
-            self.renderer = Some(crate::subtitle::LibassSubtitleRenderer::from_ass_script(
+            if self.init_failed {
+                return Err(crate::subtitle::SubtitleError::Libass(
+                    "libass initialization previously failed, skipping retry".to_string(),
+                ));
+            }
+            match crate::subtitle::LibassSubtitleRenderer::from_ass_script(
                 crate::subtitle::DEFAULT_ASS_SCRIPT_HEADER.as_bytes(),
                 crate::subtitle::LibassRenderConfig::default(),
-            )?);
-            self.seen_count = 0;
+            ) {
+                Ok(renderer) => {
+                    self.renderer = Some(renderer);
+                    self.seen_count = 0;
+                }
+                Err(error) => {
+                    self.init_failed = true;
+                    eprintln!("Erika libass initialization failed, falling back to debug renderer: {error}");
+                    return Err(crate::subtitle::SubtitleError::Libass(format!(
+                        "libass initialization failed: {error}"
+                    )));
+                }
+            }
         }
 
         let renderer = self.renderer.as_mut().unwrap();

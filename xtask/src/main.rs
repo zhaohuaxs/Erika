@@ -489,7 +489,7 @@ fn build_dependencies(options: DepsOptions) -> Result<()> {
     if !options.target.is_windows() {
         build_ffmpeg(&layout, options)?;
     } else {
-        println!("skip FFmpeg build on Windows; use vcpkg (ERIKA_FFMPEG_DIR) instead");
+        download_ffmpeg_windows(&layout)?;
     }
     if options.all {
         build_text_dependencies(&layout, options)?;
@@ -1673,6 +1673,67 @@ fn download_archive(urls: &[&str], partial_path: &PathBuf, archive_path: &PathBu
     }
 }
 
+fn download_ffmpeg_windows(layout: &WorkspaceLayout) -> Result<()> {
+    if layout.ffmpeg_build_marker.exists() {
+        println!(
+            "reuse FFmpeg build marker {}",
+            layout.ffmpeg_build_marker.display()
+        );
+        return Ok(());
+    }
+
+    let vcpkg_dir = env::var("ERIKA_FFMPEG_DIR")
+        .ok()
+        .or_else(|| env::var("VCPKG_ROOT").ok().map(|root| {
+            PathBuf::from(root).join("installed").join("x64-windows").to_string_lossy().to_string()
+        }));
+
+    if let Some(dir) = &vcpkg_dir {
+        let path = PathBuf::from(dir);
+        if path.join("include/libavformat/avformat.h").exists() {
+            let version_major = std::fs::read_to_string(path.join("include/libavcodec/version_major.h"))
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find_map(|l| {
+                            let l = l.trim();
+                            if l.starts_with("#define LIBAVCODEC_VERSION_MAJOR") {
+                                l.rsplit(' ').next().and_then(|v| v.parse::<i32>().ok())
+                            } else {
+                                None
+                            }
+                        })
+                });
+            match version_major {
+                Some(61) => {
+                    println!("FFmpeg 7.x ({}) detected at {}", version_major.unwrap(), path.display());
+                    return Ok(());
+                }
+                Some(major) => {
+                    println!(
+                        "WARNING: FFmpeg libavcodec major version {} at {} (expected 61 for FFmpeg 7.x)",
+                        major, path.display()
+                    );
+                    println!("To install FFmpeg {FFMPEG_VERSION}, run: vcpkg install --x-manifest-root=<erika_root> --x-install-root=<vcpkg_install_root>");
+                    return Ok(());
+                }
+                None => {
+                    println!("FFmpeg detected at {} but could not determine version", path.display());
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    println!("FFmpeg {FFMPEG_VERSION} not found for Windows.");
+    println!("To install FFmpeg {FFMPEG_VERSION}, use one of:");
+    println!("  1. vcpkg: set ERIKA_FFMPEG_DIR to vcpkg FFmpeg 7.1.1 install path");
+    println!("  2. vcpkg with overrides: vcpkg install --x-manifest-root=<erika_root> --x-install-root=<vcpkg_install_root>");
+    println!("  3. Manual: build FFmpeg 7.1.1 from source and set ERIKA_FFMPEG_DIR");
+    Ok(())
+}
+
+
 fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
     if layout.ffmpeg_build_marker.exists() && !options.force {
         println!(
@@ -1740,7 +1801,7 @@ fn build_ffmpeg(layout: &WorkspaceLayout, options: DepsOptions) -> Result<()> {
             configure.arg("--cc=clang");
         }
     } else if let BuildTarget::Windows(_) = options.target {
-        bail!("FFmpeg Windows build is not yet supported via xtask; use vcpkg (ERIKA_FFMPEG_DIR) instead");
+        bail!("FFmpeg Windows build is not yet supported via xtask configure+make; use `cargo run -p xtask -- deps build --target x86_64-pc-windows-msvc` to download FFmpeg {FFMPEG_VERSION} prebuilt, or set ERIKA_FFMPEG_DIR");
     } else {
         configure.arg("--cc=clang");
     }

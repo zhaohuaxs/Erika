@@ -1,0 +1,18 @@
+{
+  "name": "erika",
+  "version-string": "0.0.1",
+  "builtin-baseline": "c16c1bd46c7f6de21efc6dcf19c1069d6825df23",
+  "overrides": [
+    {
+      "name": "ffmpeg",
+      "version": "7.1.1",
+      "port-version": 6
+    }
+  ],
+  "dependencies": [
+    {
+      "name": "ffmpeg",
+      "features": ["avcodec", "avformat", "swresample", "swscale"]
+    }
+  ]
+}
