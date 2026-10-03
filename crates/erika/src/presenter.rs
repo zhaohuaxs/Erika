@@ -107,8 +107,114 @@ impl Default for PresenterConfig {
     target_os = "windows",
     not(any(target_os = "macos", target_os = "ios"))
 ))]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum WgpuOutputMode {
+    Sdr,
+    WindowsHdr { headroom: f32 },
+    Auto,
+}
+
+#[cfg(any(
+    target_os = "windows",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+impl WgpuOutputMode {
+    pub fn windows_hdr(headroom: f32) -> Self {
+        Self::WindowsHdr {
+            headroom: headroom.max(1.0),
+        }
+    }
+
+    pub fn is_hdr(self) -> bool {
+        matches!(self, Self::WindowsHdr { .. })
+    }
+
+    pub fn target_color_for_source(
+        self,
+        source: crate::renderer::pipeline::SourceColorState,
+        display_hdr_caps: Option<WindowsDisplayHdrCapabilities>,
+    ) -> crate::renderer::pipeline::TargetColorState {
+        use crate::core::ColorPrimaries;
+        use crate::renderer::pipeline::TargetColorState;
+
+        match self {
+            Self::Sdr => TargetColorState::sdr(ColorPrimaries::Bt709),
+            Self::WindowsHdr { headroom } => {
+                let headroom = headroom.max(1.0);
+                Self::build_windows_hdr_target(source, headroom)
+            }
+            Self::Auto => {
+                let caps = display_hdr_caps
+                    .unwrap_or(WindowsDisplayHdrCapabilities::sdr_fallback());
+                if caps.supports_hdr {
+                    let headroom = (caps.max_luminance_nits / 203.0).max(1.0);
+                    Self::build_windows_hdr_target(source, headroom)
+                } else {
+                    TargetColorState::sdr(ColorPrimaries::Bt709)
+                }
+            }
+        }
+    }
+
+    fn build_windows_hdr_target(
+        source: crate::renderer::pipeline::SourceColorState,
+        headroom: f32,
+    ) -> crate::renderer::pipeline::TargetColorState {
+        use crate::core::{ColorPrimaries, TransferFunction};
+        use crate::renderer::pipeline::TargetColorState;
+
+        let primaries = match (source.transfer, source.primaries) {
+            (TransferFunction::Pq, ColorPrimaries::Unknown) => ColorPrimaries::Bt2020,
+            (TransferFunction::Pq, primaries) => primaries,
+            _ => ColorPrimaries::Bt709,
+        };
+        let mut target = TargetColorState::windows_hdr(primaries, headroom);
+        if matches!(source.transfer, TransferFunction::Pq) {
+            target.transfer = TransferFunction::Pq;
+            target.peak_nits = 10_000.0;
+            target.reference_white_nits = 203.0;
+        }
+        target
+    }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
+impl Default for WgpuOutputMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowsDisplayHdrCapabilities {
+    pub supports_hdr: bool,
+    pub max_luminance_nits: f32,
+    pub bits_per_color: u32,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsDisplayHdrCapabilities {
+    pub fn sdr_fallback() -> Self {
+        Self {
+            supports_hdr: false,
+            max_luminance_nits: 100.0,
+            bits_per_color: 8,
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "windows",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 #[derive(Debug, Clone, Default)]
-pub struct WgpuRendererConfig {}
+pub struct WgpuRendererConfig {
+    pub output_mode: WgpuOutputMode,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PresenterStats {
@@ -178,6 +284,9 @@ pub struct PresenterRuntime {
     current_generation: u64,
     current_output_viewport: Option<DanmakuViewport>,
     current_danmaku_viewport: Option<DanmakuViewport>,
+    current_video_width: u32,
+    current_video_height: u32,
+    current_pixel_aspect: f64,
     subtitles: SubtitleFrameState,
     overlay: OverlayTimeline,
     render_test_pattern_when_idle: bool,
@@ -289,6 +398,9 @@ impl PresenterRuntime {
             current_generation: 1,
             current_output_viewport: None,
             current_danmaku_viewport: None,
+            current_video_width: 0,
+            current_video_height: 0,
+            current_pixel_aspect: 1.0,
             subtitles: SubtitleFrameState::default(),
             overlay: config.overlay,
             render_test_pattern_when_idle: config.render_test_pattern_when_idle,
@@ -315,6 +427,22 @@ impl PresenterRuntime {
         &self.player
     }
 
+    fn cached_video_width(&self) -> u32 {
+        if self.current_video_width > 0 {
+            self.current_video_width
+        } else {
+            self.current_output_viewport.map_or(0, |vp| vp.width)
+        }
+    }
+
+    fn cached_video_height(&self) -> u32 {
+        if self.current_video_height > 0 {
+            self.current_video_height
+        } else {
+            self.current_output_viewport.map_or(0, |vp| vp.height)
+        }
+    }
+
     pub fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()> {
         self.current_output_viewport = surface_danmaku_viewport(surface);
         self.current_danmaku = None;
@@ -333,6 +461,7 @@ impl PresenterRuntime {
 
     pub fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
         self.current_output_viewport = Some(surface_dimensions_to_viewport(width, height, scale));
+        self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
         self.last_audio_clock_sync = None;
@@ -345,6 +474,8 @@ impl PresenterRuntime {
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
+        self.current_video_width = 0;
+        self.current_video_height = 0;
         self.current_media_time = Duration::ZERO;
         self.current_generation = self.current_generation.saturating_add(1).max(1);
         self.last_audio_clock_sync = None;
@@ -385,6 +516,8 @@ impl PresenterRuntime {
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
+        self.current_video_width = 0;
+        self.current_video_height = 0;
         self.last_audio_clock_sync = None;
         self.bump_danmaku_generation();
         result
@@ -397,6 +530,8 @@ impl PresenterRuntime {
         self.current_overlay = None;
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
+        self.current_video_width = 0;
+        self.current_video_height = 0;
         self.last_audio_clock_sync = None;
         self.bump_danmaku_generation();
         result
@@ -741,13 +876,19 @@ impl PresenterRuntime {
     }
 
     fn update_overlay(&mut self, pts: Duration, generation: u64, width: usize, height: usize) {
-        let viewport = DanmakuViewport::new(
-            width.min(u32::MAX as usize) as u32,
-            height.min(u32::MAX as usize) as u32,
+        let video_width = width.min(u32::MAX as usize) as u32;
+        let video_height = height.min(u32::MAX as usize) as u32;
+        self.current_video_width = video_width;
+        self.current_video_height = video_height;
+        let viewport = DanmakuViewport::new(video_width, video_height);
+
+        let overlay_viewport = compute_overlay_viewport(
+            video_width,
+            video_height,
+            self.current_pixel_aspect,
         );
-        let mut overlay = self
-            .overlay
-            .render(pts, OverlayViewport::new(viewport.width, viewport.height));
+
+        let mut overlay = self.overlay.render(pts, overlay_viewport);
         self.subtitles.append_to_overlay(pts, &mut overlay);
         if !overlay.is_empty() {
             self.stats.overlay_frames += 1;
@@ -813,13 +954,17 @@ impl PresenterRuntime {
             .max(player_generation)
             .max(self.danmaku_generation)
             .max(1);
-        if player_time != self.current_media_time {
+        if player_time != self.current_media_time || self.current_overlay.is_none() {
             self.current_media_time = player_time;
-            if let Some(viewport) = self.current_danmaku_viewport {
-                let mut overlay = self.overlay.render(
-                    player_time,
-                    OverlayViewport::new(viewport.width, viewport.height),
+            let video_width = self.cached_video_width();
+            let video_height = self.cached_video_height();
+            if video_width > 0 && video_height > 0 {
+                let overlay_viewport = compute_overlay_viewport(
+                    video_width,
+                    video_height,
+                    self.current_pixel_aspect,
                 );
+                let mut overlay = self.overlay.render(player_time, overlay_viewport);
                 self.subtitles.append_to_overlay(player_time, &mut overlay);
                 self.current_overlay = Some(overlay);
             }
@@ -1147,9 +1292,9 @@ impl Drop for PresenterRuntime {
 fn build_renderer(
     preference: RendererBackendPreference,
     #[cfg(any(target_os = "macos", target_os = "ios"))] metal_config: MetalRendererConfig,
-    #[cfg(target_os = "windows")] _wgpu_config: WgpuRendererConfig,
+    #[cfg(target_os = "windows")] wgpu_config: WgpuRendererConfig,
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
-    _wgpu_config: WgpuRendererConfig,
+    wgpu_config: WgpuRendererConfig,
 ) -> Result<Box<dyn RendererBackend>> {
     match preference {
         RendererBackendPreference::PlatformNative | RendererBackendPreference::Auto => {
@@ -1159,10 +1304,10 @@ fn build_renderer(
             }
             #[cfg(not(any(target_os = "macos", target_os = "ios")))]
             {
-                build_wgpu_renderer()
+                build_wgpu_renderer(wgpu_config)
             }
         }
-        RendererBackendPreference::WgpuFallback => build_wgpu_renderer(),
+        RendererBackendPreference::WgpuFallback => build_wgpu_renderer(wgpu_config),
         RendererBackendPreference::FlutterTexture => Err(PlayerError::Renderer(
             "Flutter texture backend is not supported by the presenter runtime".to_string(),
         )),
@@ -1197,12 +1342,13 @@ fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBacken
 }
 
 #[cfg(feature = "wgpu")]
-fn build_wgpu_renderer() -> Result<Box<dyn RendererBackend>> {
-    Ok(Box::new(crate::renderer::wgpu::WgpuRenderer::new()?))
+#[cfg(feature = "wgpu")]
+fn build_wgpu_renderer(config: WgpuRendererConfig) -> Result<Box<dyn RendererBackend>> {
+    Ok(Box::new(crate::renderer::wgpu::WgpuRenderer::new(config)?))
 }
 
 #[cfg(not(feature = "wgpu"))]
-fn build_wgpu_renderer() -> Result<Box<dyn RendererBackend>> {
+fn build_wgpu_renderer(_config: WgpuRendererConfig) -> Result<Box<dyn RendererBackend>> {
     Err(PlayerError::Renderer(
         "wgpu renderer backend requires the `wgpu` cargo feature".to_string(),
     ))
@@ -1443,10 +1589,17 @@ impl CachedLibassTextRenderer {
             self.seen_count = total_events;
         }
 
-        let output = renderer.render(crate::subtitle::SubtitleRenderRequest::new(
+        let output = renderer.render(crate::subtitle::SubtitleRenderRequest::with_storage_and_margins(
             pts,
             viewport.width,
             viewport.height,
+            viewport.storage_width,
+            viewport.storage_height,
+            viewport.margins_top,
+            viewport.margins_bottom,
+            viewport.margins_left,
+            viewport.margins_right,
+            viewport.pixel_aspect,
         ))?;
         match output {
             crate::subtitle::SubtitleRenderOutput::Alpha(bitmaps) => {
@@ -1475,6 +1628,26 @@ fn append_text_subtitles_debug(
         )
         .frame;
     overlay.subtitle_planes.extend(frame.planes);
+}
+
+fn compute_overlay_viewport(
+    video_width: u32,
+    video_height: u32,
+    pixel_aspect: f64,
+) -> OverlayViewport {
+    let video_width = video_width.max(1);
+    let video_height = video_height.max(1);
+    OverlayViewport::with_render_params(
+        video_width,
+        video_height,
+        video_width,
+        video_height,
+        0,
+        0,
+        0,
+        0,
+        pixel_aspect,
+    )
 }
 
 #[cfg(test)]
@@ -1804,5 +1977,63 @@ mod tests {
         assert_eq!(presenter.danmaku_tracks().len(), 1);
         assert!(presenter.remove_danmaku_track(first_id));
         assert!(presenter.danmaku_tracks().is_empty());
+    }
+
+    #[cfg(any(
+        target_os = "windows",
+        not(any(target_os = "macos", target_os = "ios"))
+    ))]
+    mod wgpu_output_mode_tests {
+        use super::*;
+        use crate::core::{ColorPrimaries, TransferFunction};
+        use crate::renderer::pipeline::SourceColorState;
+
+        #[test]
+        fn windows_hdr_clamps_negative_headroom() {
+            let mode = WgpuOutputMode::windows_hdr(-1.0);
+            assert!(matches!(mode, WgpuOutputMode::WindowsHdr { headroom } if headroom == 1.0));
+        }
+
+        #[test]
+        fn sdr_is_not_hdr() {
+            assert!(!WgpuOutputMode::Sdr.is_hdr());
+        }
+
+        #[test]
+        fn windows_hdr_is_hdr() {
+            assert!(WgpuOutputMode::windows_hdr(2.0).is_hdr());
+        }
+
+        #[test]
+        fn auto_is_not_hdr() {
+            assert!(!WgpuOutputMode::Auto.is_hdr());
+        }
+
+        #[test]
+        fn auto_falls_back_to_sdr_without_display_caps() {
+            let source = SourceColorState::new(ColorPrimaries::Bt709, TransferFunction::Srgb);
+            let target = WgpuOutputMode::Auto.target_color_for_source(source, None);
+            assert_eq!(target.edr_headroom, 1.0);
+        }
+
+        #[test]
+        fn auto_selects_hdr_when_display_supports_it() {
+            let source = SourceColorState::new(ColorPrimaries::Bt2020, TransferFunction::Pq);
+            let caps = WindowsDisplayHdrCapabilities {
+                supports_hdr: true,
+                max_luminance_nits: 1000.0,
+                bits_per_color: 10,
+            };
+            let target = WgpuOutputMode::Auto.target_color_for_source(source, Some(caps));
+            assert!(target.edr_headroom > 1.0);
+            assert_eq!(target.transfer, TransferFunction::Pq);
+            assert_eq!(target.peak_nits, 10_000.0);
+            assert_eq!(target.reference_white_nits, 203.0);
+        }
+
+        #[test]
+        fn default_is_auto() {
+            assert_eq!(WgpuOutputMode::default(), WgpuOutputMode::Auto);
+        }
     }
 }

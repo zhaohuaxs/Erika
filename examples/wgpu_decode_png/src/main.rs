@@ -45,7 +45,7 @@ fn main() {
         process::exit(1);
     });
 
-    let mut renderer = WgpuRenderer::new().expect("create wgpu renderer");
+    let mut renderer = WgpuRenderer::new(Default::default()).expect("create wgpu renderer");
     println!("wgpu backend: {:?}", renderer.adapter_info().backend);
 
     let mut index = 0usize;

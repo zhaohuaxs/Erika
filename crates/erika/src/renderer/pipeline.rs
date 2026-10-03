@@ -427,6 +427,17 @@ impl TargetColorState {
             edr_headroom: headroom,
         }
     }
+
+    pub fn windows_hdr(primaries: ColorPrimaries, headroom: f32) -> Self {
+        let headroom = headroom.max(1.0);
+        Self {
+            primaries,
+            transfer: TransferFunction::Srgb,
+            peak_nits: 203.0 * headroom,
+            reference_white_nits: 203.0,
+            edr_headroom: headroom,
+        }
+    }
 }
 
 impl Default for TargetColorState {
@@ -810,6 +821,35 @@ mod tests {
 
         assert!(pipeline.requires_gamut_mapping());
         assert!(pipeline.graph.contains(RenderPassKind::GamutMap));
+    }
+
+    #[test]
+    fn windows_hdr_clamps_headroom_to_minimum() {
+        let target = TargetColorState::windows_hdr(ColorPrimaries::Bt709, -1.0);
+        assert_eq!(target.edr_headroom, 1.0);
+        assert_eq!(target.peak_nits, 203.0);
+        assert_eq!(target.reference_white_nits, 203.0);
+    }
+
+    #[test]
+    fn windows_hdr_sets_correct_fields() {
+        let target = TargetColorState::windows_hdr(ColorPrimaries::Bt2020, 4.0);
+        assert_eq!(target.primaries, ColorPrimaries::Bt2020);
+        assert_eq!(target.transfer, TransferFunction::Srgb);
+        assert_eq!(target.peak_nits, 203.0 * 4.0);
+        assert_eq!(target.reference_white_nits, 203.0);
+        assert_eq!(target.edr_headroom, 4.0);
+    }
+
+    #[test]
+    fn windows_hdr_symmetric_with_apple_edr() {
+        let windows = TargetColorState::windows_hdr(ColorPrimaries::Bt709, 3.0);
+        let apple = TargetColorState::apple_edr(ColorPrimaries::Bt709, 3.0);
+        assert_eq!(windows.primaries, apple.primaries);
+        assert_eq!(windows.transfer, apple.transfer);
+        assert_eq!(windows.peak_nits, apple.peak_nits);
+        assert_eq!(windows.reference_white_nits, apple.reference_white_nits);
+        assert_eq!(windows.edr_headroom, apple.edr_headroom);
     }
 
     fn assert_matrix_close(actual: [[f32; 3]; 3], expected: [[f32; 3]; 3], epsilon: f32) {

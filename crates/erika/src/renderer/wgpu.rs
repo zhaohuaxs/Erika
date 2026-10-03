@@ -2,13 +2,14 @@ use std::ffi::c_void;
 use wgpu::util::DeviceExt;
 
 use crate::core::{
-    ColorPrimaries, PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
+    PlatformSurface, PlayerError, PlayerVideoFrame, RenderFrameContext,
     RendererBackend, RendererRuntimeStats, Result, TransferFunction, WgpuSurfaceHandle,
     WgpuSurfaceKind,
 };
 use crate::danmaku::{DanmakuGlyphAtlas, DanmakuRenderPlan};
 use crate::ffmpeg::{PlanarFrame, PlanarPixelFormat};
 use crate::overlay::OverlayFrame;
+#[allow(unused_imports)]
 use crate::renderer::pipeline::{
     ColorRange, SourceColorState, TargetColorState, ToneMapOperator, VideoRenderPipeline,
 };
@@ -412,6 +413,16 @@ pub struct WgpuRenderer {
     overlay_render_start: Option<std::time::Instant>,
     supports_16bit_norm: bool,
     stats: WgpuRendererStats,
+    #[cfg(target_os = "windows")]
+    output_mode: crate::presenter::WgpuOutputMode,
+    #[cfg(target_os = "windows")]
+    display_hdr_caps: Option<crate::presenter::WindowsDisplayHdrCapabilities>,
+    #[cfg(target_os = "windows")]
+    is_hdr_surface: bool,
+    #[cfg(target_os = "windows")]
+    last_hdr_check_time: Option<std::time::Instant>,
+    #[cfg(target_os = "windows")]
+    hdr_state_debounce_until: Option<std::time::Instant>,
 }
 
 /// Offscreen readback targets use a linear `Rgba8Unorm` format so a clear value of
@@ -419,7 +430,7 @@ pub struct WgpuRenderer {
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
 impl WgpuRenderer {
-    pub fn new() -> Result<Self> {
+    pub fn new(config: crate::presenter::WgpuRendererConfig) -> Result<Self> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
@@ -428,9 +439,6 @@ impl WgpuRenderer {
         }))
         .map_err(|error| PlayerError::Renderer(format!("wgpu adapter request failed: {error}")))?;
 
-        // 16-bit normalized textures (R16Unorm/Rg16Unorm) are needed for P010/10-bit
-        // upload. They are not in the WebGPU baseline, so request the feature only when
-        // the adapter advertises it (true on Metal/Vulkan/DX12 native backends).
         let supports_16bit_norm = adapter
             .features()
             .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
@@ -483,6 +491,16 @@ impl WgpuRenderer {
             overlay_render_start: None,
             supports_16bit_norm,
             stats: WgpuRendererStats::default(),
+            #[cfg(target_os = "windows")]
+            output_mode: config.output_mode,
+            #[cfg(target_os = "windows")]
+            display_hdr_caps: None,
+            #[cfg(target_os = "windows")]
+            is_hdr_surface: false,
+            #[cfg(target_os = "windows")]
+            last_hdr_check_time: None,
+            #[cfg(target_os = "windows")]
+            hdr_state_debounce_until: None,
         })
     }
 
@@ -493,6 +511,180 @@ impl WgpuRenderer {
     /// Whether the adapter supports 16-bit normalized textures (needed for P010).
     pub fn supports_16bit_norm(&self) -> bool {
         self.supports_16bit_norm
+    }
+
+    fn select_surface_format(&self, caps: &wgpu::SurfaceCapabilities) -> wgpu::TextureFormat {
+        #[cfg(target_os = "windows")]
+        {
+            let display_caps = self.display_hdr_caps
+                .unwrap_or(crate::presenter::WindowsDisplayHdrCapabilities::sdr_fallback());
+
+            let want_hdr = self.output_mode.is_hdr()
+                || (matches!(self.output_mode, crate::presenter::WgpuOutputMode::Auto)
+                    && display_caps.supports_hdr);
+
+            if want_hdr {
+                if caps.formats.iter().any(|&f| f == wgpu::TextureFormat::Rgba16Float) {
+                    return wgpu::TextureFormat::Rgba16Float;
+                }
+                if caps.formats.iter().any(|&f| f == wgpu::TextureFormat::Rgb10a2Unorm) {
+                    return wgpu::TextureFormat::Rgb10a2Unorm;
+                }
+                eprintln!("erika hdr: no HDR surface format available, falling back to SDR");
+            }
+        }
+
+        caps.formats
+            .iter()
+            .copied()
+            .find(|format| !format.is_srgb())
+            .unwrap_or_else(|| caps.formats[0])
+    }
+
+    #[cfg(target_os = "windows")]
+    fn build_video_pipeline(
+        &self,
+        source: SourceColorState,
+        is_p010: bool,
+    ) -> (VideoRenderPipeline, VideoUniforms) {
+        let target = self.output_mode.target_color_for_source(source, self.display_hdr_caps);
+        let edr_output = target.edr_headroom > 1.0;
+        let pipeline = VideoRenderPipeline::new(source, target);
+        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, edr_output);
+        (pipeline, uniforms)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn check_hdr_state_change(&mut self) -> bool {
+        use std::time::{Duration, Instant};
+
+        if !matches!(self.output_mode, crate::presenter::WgpuOutputMode::Auto) {
+            return false;
+        }
+
+        let now = Instant::now();
+
+        if let Some(debounce_until) = self.hdr_state_debounce_until {
+            if now < debounce_until {
+                return false;
+            }
+        }
+
+        let is_first_query = self.display_hdr_caps.is_none();
+        if !is_first_query {
+            if let Some(last) = self.last_hdr_check_time {
+                if now.duration_since(last) < Duration::from_millis(2000) {
+                    return false;
+                }
+            }
+        }
+        self.last_hdr_check_time = Some(now);
+
+        let Some(attached) = self.surface.as_ref() else {
+            return false;
+        };
+
+        if !matches!(attached.handle.kind, WgpuSurfaceKind::WindowsHwnd) {
+            return false;
+        }
+
+        let hwnd = attached.handle.raw_window as *mut c_void;
+        let new_caps = if is_first_query {
+            crate::windows_hdr::query_display_hdr_capabilities(hwnd)
+                .unwrap_or(crate::presenter::WindowsDisplayHdrCapabilities::sdr_fallback())
+        } else {
+            crate::windows_hdr::refresh_display_hdr_capabilities(hwnd)
+                .unwrap_or(crate::presenter::WindowsDisplayHdrCapabilities::sdr_fallback())
+        };
+
+        let changed = self.display_hdr_caps.map_or(true, |old| {
+            old.supports_hdr != new_caps.supports_hdr
+        });
+
+        if changed {
+            self.display_hdr_caps = Some(new_caps);
+            self.hdr_state_debounce_until = Some(now + Duration::from_millis(500));
+        }
+
+        changed
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn set_output_mode(&mut self, mode: crate::presenter::WgpuOutputMode) -> Result<()> {
+        self.output_mode = mode;
+        if self.surface.is_some() {
+            self.video_pipeline = None;
+            self.overlay_pipeline = None;
+            self.danmaku_batch_pipeline = None;
+            self.reconfigure_surface_for_hdr();
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    pub fn display_hdr_capabilities(&self) -> Option<crate::presenter::WindowsDisplayHdrCapabilities> {
+        self.display_hdr_caps
+    }
+
+    #[cfg(target_os = "windows")]
+    fn reconfigure_surface_for_hdr(&mut self) {
+        let Some(attached) = self.surface.as_ref() else {
+            return;
+        };
+
+        let caps = attached.surface.get_capabilities(&self.adapter);
+        let new_format = self.select_surface_format(&caps);
+
+        let was_hdr = self.is_hdr_surface;
+        let is_hdr = matches!(
+            new_format,
+            wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgb10a2Unorm
+        );
+
+        if was_hdr == is_hdr {
+            return;
+        }
+
+        let width = attached.config.width;
+        let height = attached.config.height;
+        let present_mode = attached.config.present_mode;
+        let alpha_mode = attached.config.alpha_mode;
+
+        let new_config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: new_format,
+            width,
+            height,
+            present_mode,
+            desired_maximum_frame_latency: 2,
+            alpha_mode,
+            view_formats: vec![],
+        };
+
+        if let Some(attached) = self.surface.as_mut() {
+            attached.surface.configure(&self.device, &new_config);
+            attached.config = new_config;
+        }
+
+        self.is_hdr_surface = is_hdr;
+        if is_hdr {
+            self.try_set_swap_chain_color_space();
+        }
+        eprintln!(
+            "erika hdr: surface reconfigured from {} to {} (HDR={})",
+            if was_hdr { "HDR" } else { "SDR" },
+            if is_hdr { "HDR" } else { "SDR" },
+            is_hdr
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    fn try_set_swap_chain_color_space(&self) {
+        if let Some(caps) = self.display_hdr_caps {
+            if caps.supports_hdr {
+                eprintln!("erika hdr: display reports HDR capable, surface format will signal DWM for HDR output");
+            }
+        }
     }
 
     pub fn stats(&self) -> WgpuRendererStats {
@@ -1201,18 +1393,21 @@ impl WgpuRenderer {
 
         if !frame.subtitle_changed {
             if let Some(cache) = &self.overlay_alpha_atlas_cache {
-                #[cfg(debug_assertions)]
-                {
-                    self.stats.overlay_cache_hits += 1;
+                let current_viewport = layout.overlay_viewport();
+                if cache.last_viewport == Some(current_viewport) {
+                    #[cfg(debug_assertions)]
+                    {
+                        self.stats.overlay_cache_hits += 1;
+                    }
+                    draws.extend(cache.draws.iter().map(|d| OverlayDraw {
+                        bind_group: d.bind_group.clone(),
+                        _texture: d._texture.clone(),
+                        _uniform: d._uniform.clone(),
+                        instance_count: d.instance_count,
+                        use_batch_pipeline: d.use_batch_pipeline,
+                    }));
+                    return Ok(draws);
                 }
-                draws.extend(cache.draws.iter().map(|d| OverlayDraw {
-                    bind_group: d.bind_group.clone(),
-                    _texture: d._texture.clone(),
-                    _uniform: d._uniform.clone(),
-                    instance_count: d.instance_count,
-                    use_batch_pipeline: d.use_batch_pipeline,
-                }));
-                return Ok(draws);
             }
         }
 
@@ -2071,8 +2266,7 @@ impl WgpuRenderer {
             crate::windows::get_d3d11_texture_shared_handle(texture_ptr)
         } {
             Ok(info) => info,
-            Err(e) => {
-                eprintln!("d3d11va zerocopy: shared handle failed: {e}");
+            Err(_) => {
                 return Ok(None);
             }
         };
@@ -2083,10 +2277,6 @@ impl WgpuRenderer {
         let (wgpu_format, is_p010) = match d3d11va_wgpu_format(shared_info.format) {
             Some(f) => f,
             None => {
-                eprintln!(
-                    "d3d11va zerocopy: unsupported DXGI format {}",
-                    shared_info.format
-                );
                 return Ok(None);
             }
         };
@@ -2103,7 +2293,7 @@ impl WgpuRenderer {
             return result;
         }
 
-        eprintln!("d3d11va zerocopy: fallback to CPU readback");
+
         Ok(None)
     }
 
@@ -2135,9 +2325,6 @@ impl WgpuRenderer {
         frame: &PlayerVideoFrame,
     ) -> Result<Option<()>> {
         if is_p010 && !self.supports_16bit_norm {
-            eprintln!(
-                "d3d11va zerocopy: P010 requires TEXTURE_FORMAT_16BIT_NORM, adapter lacks support"
-            );
             return Ok(None);
         }
 
@@ -2146,7 +2333,6 @@ impl WgpuRenderer {
         let hal_device = match hal_device_guard.as_deref() {
             Some(d) => d,
             None => {
-                eprintln!("d3d11va zerocopy: D3D12 backend not available");
                 return Ok(None);
             }
         };
@@ -2157,24 +2343,18 @@ impl WgpuRenderer {
         let d3d12_luid = unsafe { d3d12_device.GetAdapterLuid() };
         let src_luid = &shared_handle.adapter_luid;
         if src_luid.LowPart != d3d12_luid.LowPart || src_luid.HighPart != d3d12_luid.HighPart {
-            eprintln!(
-                "d3d11va zerocopy: cross-adapter (D3D11 LUID={}:{}, D3D12 LUID={}:{}), skipping D3D12 path",
-                src_luid.LowPart, src_luid.HighPart,
-                d3d12_luid.LowPart, d3d12_luid.HighPart
-            );
+
             return Ok(None);
         }
 
         let d3d12_resource: windows::Win32::Graphics::Direct3D12::ID3D12Resource = unsafe {
             let mut result = None;
-            if let Err(e) = d3d12_device.OpenSharedHandle(shared_handle.handle, &mut result) {
-                eprintln!("d3d11va zerocopy: D3D12 OpenSharedHandle failed: {e:?}");
+            if let Err(_) = d3d12_device.OpenSharedHandle(shared_handle.handle, &mut result) {
                 return Ok(None);
             }
             match result {
                 Some(r) => r,
                 None => {
-                    eprintln!("d3d11va zerocopy: D3D12 OpenSharedHandle returned null");
                     return Ok(None);
                 }
             }
@@ -2227,9 +2407,15 @@ impl WgpuRenderer {
         .range(frame.frame.color_range())
         .matrix(frame.frame.matrix_coefficients())
         .hdr_metadata(frame.frame.hdr_metadata());
-        let pipeline =
-            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
-        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+        #[cfg(target_os = "windows")]
+        let (_pipeline, uniforms) = self.build_video_pipeline(source, is_p010);
+        #[cfg(not(target_os = "windows"))]
+        let (_pipeline, uniforms) = {
+            let pipeline =
+                VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+            let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+            (pipeline, uniforms)
+        };
 
         self.current_video = Some(UploadedVideoFrame {
             luma: luma_view,
@@ -2239,7 +2425,7 @@ impl WgpuRenderer {
             uniforms,
         });
 
-        eprintln!("d3d11va zerocopy: D3D12 path selected");
+
         Ok(Some(()))
     }
 
@@ -2267,9 +2453,6 @@ impl WgpuRenderer {
         frame: &PlayerVideoFrame,
     ) -> Result<Option<()>> {
         if is_p010 && !self.supports_16bit_norm {
-            eprintln!(
-                "d3d11va zerocopy: P010 requires TEXTURE_FORMAT_16BIT_NORM, adapter lacks support"
-            );
             return Ok(None);
         }
 
@@ -2278,7 +2461,6 @@ impl WgpuRenderer {
             .features()
             .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_WIN32)
         {
-            eprintln!("d3d11va zerocopy: Vulkan backend lacks VULKAN_EXTERNAL_MEMORY_WIN32");
             return Ok(None);
         }
 
@@ -2287,7 +2469,6 @@ impl WgpuRenderer {
         let hal_device = match hal_device_guard.as_deref() {
             Some(d) => d,
             None => {
-                eprintln!("d3d11va zerocopy: Vulkan hal device not available");
                 return Ok(None);
             }
         };
@@ -2318,7 +2499,7 @@ impl WgpuRenderer {
         } {
             Ok(t) => t,
             Err(_) => {
-                eprintln!("d3d11va zerocopy: Vulkan texture_from_d3d11_shared_handle failed");
+
                 return Ok(None);
             }
         };
@@ -2356,9 +2537,15 @@ impl WgpuRenderer {
         .range(frame.frame.color_range())
         .matrix(frame.frame.matrix_coefficients())
         .hdr_metadata(frame.frame.hdr_metadata());
-        let pipeline =
-            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
-        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+        #[cfg(target_os = "windows")]
+        let (_pipeline, uniforms) = self.build_video_pipeline(source, is_p010);
+        #[cfg(not(target_os = "windows"))]
+        let (_pipeline, uniforms) = {
+            let pipeline =
+                VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+            let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+            (pipeline, uniforms)
+        };
 
         self.current_video = Some(UploadedVideoFrame {
             luma: luma_view,
@@ -2368,7 +2555,7 @@ impl WgpuRenderer {
             uniforms,
         });
 
-        eprintln!("d3d11va zerocopy: Vulkan path selected");
+
         Ok(Some(()))
     }
 }
@@ -2458,6 +2645,7 @@ impl RendererBackend for WgpuRenderer {
                         "invalid hwnd: null pointer".to_string(),
                     ));
                 }
+
                 let hwnd_nonzero = match NonZeroIsize::new(hwnd as isize) {
                     Some(nz) => nz,
                     None => {
@@ -2538,14 +2726,7 @@ impl RendererBackend for WgpuRenderer {
                 ));
             }
         }
-        // Prefer a non-sRGB format: the video shader already emits display-encoded
-        // values for the SDR target, so an sRGB surface would double-encode gamma.
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|format| !format.is_srgb())
-            .unwrap_or_else(|| caps.formats[0]);
+        let format = self.select_surface_format(&caps);
         let (surface_width, surface_height) =
             scaled_surface_size(handle.width, handle.height, handle.scale);
         let config = wgpu::SurfaceConfiguration {
@@ -2559,6 +2740,19 @@ impl RendererBackend for WgpuRenderer {
             view_formats: vec![],
         };
         surface.configure(&self.device, &config);
+
+        #[cfg(target_os = "windows")]
+        {
+            self.is_hdr_surface = matches!(
+                format,
+                wgpu::TextureFormat::Rgba16Float | wgpu::TextureFormat::Rgb10a2Unorm
+            );
+            if self.is_hdr_surface {
+                eprintln!("erika hdr: surface configured with HDR format {:?}", format);
+                self.try_set_swap_chain_color_space();
+            }
+        }
+
 
         self.stats.surface_width = config.width;
         self.stats.surface_height = config.height;
@@ -2585,6 +2779,7 @@ impl RendererBackend for WgpuRenderer {
         }
         let (surface_width, surface_height) = scaled_surface_size(width, height, scale);
         self.configure_surface(surface_width, surface_height);
+        self.overlay_alpha_atlas_cache = None;
         if let Some(attached) = self.surface.as_mut() {
             attached.handle.width = width;
             attached.handle.height = height;
@@ -2633,13 +2828,27 @@ impl RendererBackend for WgpuRenderer {
                 .range(frame_ref.color_range())
                 .matrix(frame_ref.matrix_coefficients())
                 .hdr_metadata(frame_ref.hdr_metadata());
-        let pipeline =
-            VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
-        let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+        #[cfg(target_os = "windows")]
+        let (_pipeline, uniforms) = self.build_video_pipeline(source, is_p010);
+        #[cfg(not(target_os = "windows"))]
+        let (_pipeline, uniforms) = {
+            let pipeline =
+                VideoRenderPipeline::new(source, TargetColorState::sdr(ColorPrimaries::Bt709));
+            let uniforms = VideoUniforms::from_pipeline(&pipeline, is_p010, false);
+            (pipeline, uniforms)
+        };
         self.upload_planar_with_context(planar, uniforms)
     }
 
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool> {
+        #[cfg(target_os = "windows")]
+        if self.check_hdr_state_change() {
+            self.video_pipeline = None;
+            self.overlay_pipeline = None;
+            self.danmaku_batch_pipeline = None;
+            self.reconfigure_surface_for_hdr();
+        }
+
         if self.current_video.is_none() {
             return Ok(false);
         }
@@ -2740,7 +2949,7 @@ mod tests {
 
     #[test]
     fn wgpu_renderer_clears_offscreen_target_to_expected_color() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
         let color = WgpuClearColor::new(0.25, 0.5, 0.75, 1.0);
 
         let readback = renderer.clear_offscreen(4, 3, color).unwrap();
@@ -2774,7 +2983,7 @@ mod tests {
 
     #[test]
     fn wgpu_renderer_render_test_frame_without_surface_uses_offscreen_path() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
 
         renderer.render_test_frame(0.0).unwrap();
 
@@ -2786,7 +2995,7 @@ mod tests {
 
     #[test]
     fn wgpu_renderer_prepares_danmaku_glyph_atlas_draws_and_reuses_cache() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
         renderer.ensure_overlay_pipeline(OFFSCREEN_FORMAT);
         let atlas = DanmakuGlyphAtlas {
             width: 4,
@@ -2830,7 +3039,7 @@ mod tests {
 
     #[test]
     fn wgpu_renderer_rejects_metal_surface() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
         let result = renderer.attach_surface(PlatformSurface::Metal(MetalSurfaceHandle::new(
             42, 640, 360, 2.0,
         )));
@@ -2974,7 +3183,7 @@ mod tests {
 
     #[test]
     fn wgpu_video_nv12_matches_cpu_reference() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
 
         let sdr = VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
         assert_eq!(sdr.source_transfer, 1);
@@ -3045,7 +3254,7 @@ mod tests {
 
     #[test]
     fn wgpu_renderer_is_usable_as_dyn_backend_and_reports_no_current_frame() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
         // The presenter holds the backend as `Box<dyn RendererBackend>`; confirm the
         // wgpu renderer is object-safe through the trait and reports no current frame
         // so the presenter falls back to a test frame.
@@ -3057,7 +3266,7 @@ mod tests {
 
     #[test]
     fn wgpu_uploads_and_renders_p010_frame() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
         if !renderer.supports_16bit_norm() {
             // Backend without TEXTURE_FORMAT_16BIT_NORM cannot do P010; skip.
             return;
@@ -3103,7 +3312,7 @@ mod tests {
 
     #[test]
     fn wgpu_video_rejects_wrong_plane_sizes() {
-        let mut renderer = WgpuRenderer::new().unwrap();
+        let mut renderer = WgpuRenderer::new(Default::default()).unwrap();
         let uniforms =
             VideoUniforms::from_pipeline(&VideoRenderPipeline::sdr_default(), false, false);
 

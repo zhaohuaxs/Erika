@@ -84,7 +84,7 @@ fn bt709_limited_uniforms() -> VideoUniforms {
 
 fn main() {
     let (luma, chroma) = build_color_bars_nv12();
-    let mut renderer = WgpuRenderer::new().expect("create wgpu renderer");
+    let mut renderer = WgpuRenderer::new(Default::default()).expect("create wgpu renderer");
     println!("wgpu backend: {:?}", renderer.adapter_info().backend);
 
     let readback = renderer

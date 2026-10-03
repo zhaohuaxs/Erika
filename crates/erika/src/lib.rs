@@ -14,6 +14,9 @@ pub mod text;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+#[cfg(target_os = "windows")]
+pub mod windows_hdr;
+
 mod trace;
 
 pub use core::*;

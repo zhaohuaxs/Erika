@@ -194,6 +194,7 @@ impl MetalRendererImpl {
         let drawable_height = (height as f64 * scale).max(1.0);
         let size = CGSize::new(drawable_width, drawable_height);
         layer.setDrawableSize(size);
+        self.overlay_alpha_atlas_cache = None;
         self.stats.drawable_width = drawable_width.round() as u32;
         self.stats.drawable_height = drawable_height.round() as u32;
     }

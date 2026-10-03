@@ -12,17 +12,73 @@ use crate::subtitle::{
     SubtitleRenderOutput, SubtitleRendererCore, SubtitleTimeline, SubtitleViewport,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverlayViewport {
+    /// 视频帧宽度（像素），传入 ass_set_frame_size
     pub width: u32,
+    /// 视频帧高度（像素），传入 ass_set_frame_size
     pub height: u32,
+    /// 视频帧原始存储宽度（像素），传入 ass_set_storage_size
+    pub storage_width: u32,
+    /// 视频帧原始存储高度（像素），传入 ass_set_storage_size
+    pub storage_height: u32,
+    /// 视频区域上边距（像素），必须为 0：letterboxing 由 map_source_rect() 的 target_rect 处理
+    pub margins_top: u32,
+    /// 视频区域下边距（像素），必须为 0
+    pub margins_bottom: u32,
+    /// 视频区域左边距（像素），必须为 0
+    pub margins_left: u32,
+    /// 视频区域右边距（像素），必须为 0
+    pub margins_right: u32,
+    /// 像素宽高比（display_par × video_sar），默认 1.0
+    pub pixel_aspect: f64,
 }
 
 impl OverlayViewport {
+    /// 创建仅包含视频帧尺寸的视口
+    /// width/height 为视频帧尺寸（传入 ass_set_frame_size）
+    /// storage_size 默认等于视频帧尺寸，margins 默认为 0，pixel_aspect 默认为 1.0
     pub fn new(width: u32, height: u32) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+        Self {
+            width,
+            height,
+            storage_width: width,
+            storage_height: height,
+            margins_top: 0,
+            margins_bottom: 0,
+            margins_left: 0,
+            margins_right: 0,
+            pixel_aspect: 1.0,
+        }
+    }
+
+    /// 创建带有完整渲染参数的视口
+    /// width/height 为视频帧尺寸（传入 ass_set_frame_size）
+    /// storage_width/storage_height 为视频帧原始尺寸（传入 ass_set_storage_size）
+    /// ⚠ margins 必须传入全 0：letterboxing 由 map_source_rect() 的 target_rect 处理
+    pub fn with_render_params(
+        width: u32,
+        height: u32,
+        storage_width: u32,
+        storage_height: u32,
+        margins_top: u32,
+        margins_bottom: u32,
+        margins_left: u32,
+        margins_right: u32,
+        pixel_aspect: f64,
+    ) -> Self {
         Self {
             width: width.max(1),
             height: height.max(1),
+            storage_width: storage_width.max(1),
+            storage_height: storage_height.max(1),
+            margins_top,
+            margins_bottom,
+            margins_left,
+            margins_right,
+            pixel_aspect: if pixel_aspect > 0.0 { pixel_aspect } else { 1.0 },
         }
     }
 }
@@ -74,10 +130,17 @@ impl OverlaySubtitleRenderer {
                 let mut renderer = renderer
                     .lock()
                     .map_err(|_| SubtitleError::Libass("renderer lock poisoned".to_string()))?;
-                let output = renderer.render(SubtitleRenderRequest::new(
+                let output = renderer.render(SubtitleRenderRequest::with_storage_and_margins(
                     pts,
                     viewport.width,
                     viewport.height,
+                    viewport.storage_width,
+                    viewport.storage_height,
+                    viewport.margins_top,
+                    viewport.margins_bottom,
+                    viewport.margins_left,
+                    viewport.margins_right,
+                    viewport.pixel_aspect,
                 ))?;
                 let changed = match &output {
                     SubtitleRenderOutput::Rgba(_) => true,

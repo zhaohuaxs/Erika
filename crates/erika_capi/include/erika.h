@@ -79,6 +79,8 @@ typedef enum ErikaFlutterTextureKind {
 typedef enum ErikaPresenterOutputMode {
   ErikaPresenterOutputMode_Sdr = 0,
   ErikaPresenterOutputMode_AppleEdr = 1,
+  ErikaPresenterOutputMode_WindowsHdr = 2,
+  ErikaPresenterOutputMode_Auto = 3,
 } ErikaPresenterOutputMode;
 
 typedef struct ErikaPresenterConfig {

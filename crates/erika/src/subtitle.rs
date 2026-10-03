@@ -345,7 +345,9 @@ impl SubtitleAlphaBitmap {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubtitleBitmapSet {
     pub pts: Duration,
+    /// libass 渲染坐标系宽度（视频帧尺寸），非 surface 尺寸
     pub frame_width: u32,
+    /// libass 渲染坐标系高度（视频帧尺寸），非 surface 尺寸
     pub frame_height: u32,
     pub color_space: SubtitleBitmapColorSpace,
     pub parts: Vec<SubtitleAlphaBitmap>,
@@ -401,9 +403,13 @@ pub struct SubtitleFrame {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubtitleRenderViewport {
+    /// 视频帧宽度（像素），传入 ass_set_frame_size
     pub width: u32,
+    /// 视频帧高度（像素），传入 ass_set_frame_size
     pub height: u32,
+    /// 视频帧原始存储宽度（像素），传入 ass_set_storage_size
     pub storage_width: u32,
+    /// 视频帧原始存储高度（像素），传入 ass_set_storage_size
     pub storage_height: u32,
 }
 
@@ -420,10 +426,15 @@ impl SubtitleRenderViewport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SubtitleRenderRequest {
     pub pts: Duration,
     pub viewport: SubtitleRenderViewport,
+    pub margins_top: u32,
+    pub margins_bottom: u32,
+    pub margins_left: u32,
+    pub margins_right: u32,
+    pub pixel_aspect: f64,
 }
 
 impl SubtitleRenderRequest {
@@ -431,6 +442,39 @@ impl SubtitleRenderRequest {
         Self {
             pts,
             viewport: SubtitleRenderViewport::new(width, height),
+            margins_top: 0,
+            margins_bottom: 0,
+            margins_left: 0,
+            margins_right: 0,
+            pixel_aspect: 1.0,
+        }
+    }
+
+    pub fn with_storage_and_margins(
+        pts: Duration,
+        frame_width: u32,
+        frame_height: u32,
+        storage_width: u32,
+        storage_height: u32,
+        margins_top: u32,
+        margins_bottom: u32,
+        margins_left: u32,
+        margins_right: u32,
+        pixel_aspect: f64,
+    ) -> Self {
+        Self {
+            pts,
+            viewport: SubtitleRenderViewport {
+                width: frame_width.max(1),
+                height: frame_height.max(1),
+                storage_width: storage_width.max(1),
+                storage_height: storage_height.max(1),
+            },
+            margins_top,
+            margins_bottom,
+            margins_left,
+            margins_right,
+            pixel_aspect: if pixel_aspect > 0.0 { pixel_aspect } else { 1.0 },
         }
     }
 }
@@ -477,7 +521,7 @@ pub struct RawAssImage {
 
 #[cfg(feature = "libass")]
 mod libass_ffi {
-    use libc::{c_char, c_int, c_longlong, c_void, size_t};
+    use libc::{c_char, c_double, c_int, c_longlong, c_void, size_t};
 
     pub type AssImageType = c_int;
     pub type AssLibrary = c_void;
@@ -518,6 +562,14 @@ mod libass_ffi {
             glyph_max: c_int,
             bitmap_max_size: c_int,
         );
+        pub fn ass_set_margins(
+            renderer: *mut AssRenderer,
+            top: c_int,
+            bottom: c_int,
+            left: c_int,
+            right: c_int,
+        );
+        pub fn ass_set_pixel_aspect(renderer: *mut AssRenderer, par: c_double);
         pub fn ass_read_memory(
             library: *mut AssLibrary,
             buffer: *mut c_char,
@@ -557,15 +609,16 @@ impl Default for LibassRenderConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LibassRenderOperation {
     SetFrameSize { width: u32, height: u32 },
     SetStorageSize { width: u32, height: u32 },
-    SetCacheLimits { glyphs: i32, bitmap_mb: i32 },
+    SetMargins { top: i32, bottom: i32, left: i32, right: i32 },
+    SetPixelAspect { par: f64 },
     RenderFrame { timestamp_ms: i64 },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LibassRenderPlan {
     pub request: SubtitleRenderRequest,
     pub config: LibassRenderConfig,
@@ -587,9 +640,14 @@ impl LibassRenderPlan {
                     width: viewport.storage_width,
                     height: viewport.storage_height,
                 },
-                LibassRenderOperation::SetCacheLimits {
-                    glyphs: config.glyph_cache_limit,
-                    bitmap_mb: config.bitmap_cache_limit_mb,
+                LibassRenderOperation::SetMargins {
+                    top: request.margins_top as i32,
+                    bottom: request.margins_bottom as i32,
+                    left: request.margins_left as i32,
+                    right: request.margins_right as i32,
+                },
+                LibassRenderOperation::SetPixelAspect {
+                    par: request.pixel_aspect,
                 },
                 LibassRenderOperation::RenderFrame {
                     timestamp_ms: duration_to_millis_i64(request.pts),
@@ -747,16 +805,24 @@ impl SubtitleRenderer for LibassSubtitleRenderer {
         let frame_height = libass_dimension(viewport.height, "frame height")?;
         let storage_width = libass_dimension(viewport.storage_width, "storage width")?;
         let storage_height = libass_dimension(viewport.storage_height, "storage height")?;
+        let margins_top = libass_dimension(request.margins_top, "margins top")?;
+        let margins_bottom = libass_dimension(request.margins_bottom, "margins bottom")?;
+        let margins_left = libass_dimension(request.margins_left, "margins left")?;
+        let margins_right = libass_dimension(request.margins_right, "margins right")?;
+        let pixel_aspect = request.pixel_aspect;
         let timestamp_ms = duration_to_millis_i64(request.pts);
 
         unsafe {
             libass_ffi::ass_set_frame_size(self.renderer.as_ptr(), frame_width, frame_height);
             libass_ffi::ass_set_storage_size(self.renderer.as_ptr(), storage_width, storage_height);
-            libass_ffi::ass_set_cache_limits(
+            libass_ffi::ass_set_margins(
                 self.renderer.as_ptr(),
-                self.config.glyph_cache_limit,
-                self.config.bitmap_cache_limit_mb,
+                margins_top,
+                margins_bottom,
+                margins_left,
+                margins_right,
             );
+            libass_ffi::ass_set_pixel_aspect(self.renderer.as_ptr(), pixel_aspect);
 
             let mut changed = 0;
             let images = libass_ffi::ass_render_frame(

@@ -139,6 +139,8 @@ pub enum ErikaFlutterTextureKind {
 pub enum ErikaPresenterOutputMode {
     Sdr = 0,
     AppleEdr = 1,
+    WindowsHdr = 2,
+    Auto = 3,
 }
 
 impl ErikaPresenterOutputMode {
@@ -146,6 +148,15 @@ impl ErikaPresenterOutputMode {
     fn from_raw(value: i32) -> Self {
         match value {
             1 => Self::AppleEdr,
+            _ => Self::Sdr,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn from_raw(value: i32) -> Self {
+        match value {
+            2 => Self::WindowsHdr,
+            3 => Self::Auto,
             _ => Self::Sdr,
         }
     }
@@ -675,8 +686,25 @@ fn presenter_config_from_c(config: ErikaPresenterConfig) -> PresenterConfig {
 }
 
 #[cfg(target_os = "windows")]
-fn presenter_config_from_c(_config: ErikaPresenterConfig) -> PresenterConfig {
-    PresenterConfig::default()
+fn presenter_config_from_c(config: ErikaPresenterConfig) -> PresenterConfig {
+    use erika::presenter::WgpuOutputMode;
+
+    let output_mode = match ErikaPresenterOutputMode::from_raw(config.output_mode) {
+        ErikaPresenterOutputMode::WindowsHdr => WgpuOutputMode::windows_hdr(
+            if config.edr_headroom.is_finite() && config.edr_headroom >= 1.0 {
+                config.edr_headroom
+            } else {
+                1.0
+            },
+        ),
+        ErikaPresenterOutputMode::Auto => WgpuOutputMode::Auto,
+        _ => WgpuOutputMode::Sdr,
+    };
+
+    PresenterConfig {
+        renderer: erika::presenter::WgpuRendererConfig { output_mode },
+        ..PresenterConfig::default()
+    }
 }
 
 fn danmaku_config_from_c(

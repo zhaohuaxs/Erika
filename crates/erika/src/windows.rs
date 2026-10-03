@@ -53,10 +53,7 @@ pub unsafe fn get_d3d11_texture_shared_handle(
     };
 
     let adapter_luid = unsafe { get_d3d11_adapter_luid(&texture) };
-    eprintln!(
-        "d3d11va shared handle: D3D11 adapter LUID = {}:{}",
-        adapter_luid.LowPart, adapter_luid.HighPart
-    );
+
 
     let dxgi_resource1: Option<IDXGIResource1> = dxgi_resource.cast().ok();
 
@@ -69,7 +66,6 @@ pub unsafe fn get_d3d11_texture_shared_handle(
             )
         } {
             Ok(handle) => {
-                eprintln!("d3d11va shared handle: direct path (NT handle)");
                 return Ok(D3d11SharedHandle {
                     handle,
                     width: desc.Width,
@@ -78,15 +74,13 @@ pub unsafe fn get_d3d11_texture_shared_handle(
                     adapter_luid,
                 });
             }
-            Err(e) => {
-                eprintln!("d3d11va shared handle: direct IDXGIResource1::CreateSharedHandle failed: {e:?}");
-            }
+            Err(_) => {}
         }
     }
 
     match unsafe { dxgi_resource.GetSharedHandle() } {
         Ok(handle) => {
-            eprintln!("d3d11va shared handle: direct path (kernel handle)");
+
             Ok(D3d11SharedHandle {
                 handle,
                 width: desc.Width,
@@ -145,7 +139,7 @@ unsafe fn create_shared_copy_and_get_handle(
     };
 
     if needs_new {
-        eprintln!("d3d11va shared handle: staging cache miss, creating new texture (SHARED | SHARED_NTHANDLE)");
+
         let shared_desc = D3D11_TEXTURE2D_DESC {
             Width: src_desc.Width,
             Height: src_desc.Height,
@@ -181,10 +175,6 @@ unsafe fn create_shared_copy_and_get_handle(
         .and_then(|c| c.texture.as_ref())
         .ok_or_else(|| "no shared texture in cache".to_string())?;
 
-    if !needs_new {
-        eprintln!("d3d11va shared handle: staging cache hit");
-    }
-    eprintln!("d3d11va shared handle: CopySubresourceRegion staging path");
 
     unsafe {
         ctx.CopySubresourceRegion(
@@ -205,8 +195,7 @@ unsafe fn create_shared_copy_and_get_handle(
 
     let dxgi_resource1: IDXGIResource1 = match resource.cast() {
         Ok(r1) => r1,
-        Err(e) => {
-            eprintln!("d3d11va shared handle: cast to IDXGIResource1 failed: {e}");
+        Err(_) => {
             let dxgi_resource: IDXGIResource = resource
                 .cast()
                 .map_err(|e2| format!("cast to IDXGIResource also failed: {e2}"))?;
@@ -236,8 +225,7 @@ unsafe fn create_shared_copy_and_get_handle(
             format: src_desc.Format.0,
             adapter_luid,
         }),
-        Err(e) => {
-            eprintln!("d3d11va shared handle: CreateSharedHandle failed: {e:?}, falling back to GetSharedHandle");
+        Err(_) => {
             let dxgi_resource: IDXGIResource = resource
                 .cast()
                 .map_err(|e2| format!("cast to IDXGIResource failed: {e2}"))?;

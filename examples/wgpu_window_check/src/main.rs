@@ -57,7 +57,7 @@ fn main() {
 }
 
 fn run(layer: *mut c_void, scale: f64, seconds: f64) -> Result<(), String> {
-    let mut renderer = WgpuRenderer::new().map_err(|e| e.to_string())?;
+    let mut renderer = WgpuRenderer::new(Default::default()).map_err(|e| e.to_string())?;
     println!("wgpu backend: {:?}", renderer.adapter_info().backend);
 
     let surface = PlatformSurface::Wgpu(WgpuSurfaceHandle::new(

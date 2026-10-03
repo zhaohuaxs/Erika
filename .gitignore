@@ -6,3 +6,4 @@
 /third_party/dist/
 /packages/erika_flutter/ios/native/
 .DS_Store
+Cargo.lock

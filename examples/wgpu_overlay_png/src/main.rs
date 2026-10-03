@@ -26,7 +26,7 @@ fn main() {
         .unwrap_or_else(|| "/tmp/erika_wgpu_overlay.png".to_string());
 
     let (luma, chroma) = color_bars_nv12();
-    let mut renderer = WgpuRenderer::new().expect("create wgpu renderer");
+    let mut renderer = WgpuRenderer::new(Default::default()).expect("create wgpu renderer");
     println!("wgpu backend: {:?}", renderer.adapter_info().backend);
     renderer
         .upload_nv12(WIDTH, HEIGHT, &luma, &chroma, bars_uniforms())
