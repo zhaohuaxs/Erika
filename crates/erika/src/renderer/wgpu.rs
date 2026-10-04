@@ -215,6 +215,10 @@ fn tone_map_code(operator: ToneMapOperator) -> u32 {
         ToneMapOperator::Clip => 0,
         ToneMapOperator::Reinhard => 1,
         ToneMapOperator::Mobius => 2,
+        ToneMapOperator::Bt2390 => 3,
+        ToneMapOperator::Spline => 4,
+        ToneMapOperator::Bt2446a => 5,
+        ToneMapOperator::St209410 => 6,
     }
 }
 

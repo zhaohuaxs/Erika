@@ -168,7 +168,7 @@ impl WgpuOutputMode {
             (TransferFunction::Pq, primaries) => primaries,
             _ => ColorPrimaries::Bt709,
         };
-        let mut target = TargetColorState::windows_hdr(primaries, headroom);
+        let mut target = TargetColorState::extended_linear(primaries, 203.0, headroom);
         if matches!(source.transfer, TransferFunction::Pq) {
             target.transfer = TransferFunction::Pq;
             target.peak_nits = 10_000.0;
