@@ -5,6 +5,7 @@
 #include <libavutil/dict.h>
 #include <libavutil/error.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
 #include <libavutil/mastering_display_metadata.h>
 #include <libavutil/mem.h>
 #include <libavutil/pixdesc.h>

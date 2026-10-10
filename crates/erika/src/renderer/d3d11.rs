@@ -1977,21 +1977,17 @@ impl D3d11Renderer {
         draws: &mut Vec<D3d11OverlayDraw>,
     ) -> Result<()> {
         let bitmaps = &frame.subtitle_alpha_planes;
+        const MAX_ATLAS_DIM: usize = 8192;
+        struct AtlasPlacement {
+            index: usize,
+            atlas_x: usize,
+            atlas_y: usize,
+        }
         let mut atlas_width = 0usize;
         let mut atlas_height = 0usize;
-        for bitmap in bitmaps {
-            if bitmap.placement.width == 0 || bitmap.placement.height == 0 {
-                continue;
-            }
-            atlas_width += bitmap.placement.width as usize;
-            atlas_height = atlas_height.max(bitmap.placement.height as usize);
-        }
-        if atlas_width == 0 || atlas_height == 0 {
-            return Ok(());
-        }
-
-        let mut pixels = vec![0u8; atlas_width * atlas_height];
-        let mut cursor_x = 0usize;
+        let mut row_x = 0usize;
+        let mut row_y = 0usize;
+        let mut row_h = 0usize;
         let mut placements = Vec::new();
         for (index, bitmap) in bitmaps.iter().enumerate() {
             let bw = bitmap.placement.width as usize;
@@ -2009,13 +2005,38 @@ impl D3d11Renderer {
                     bitmap.stride
                 )));
             }
+            if row_x + bw > MAX_ATLAS_DIM {
+                row_y += row_h;
+                row_x = 0;
+                row_h = 0;
+            }
+            if bw > MAX_ATLAS_DIM || bh > MAX_ATLAS_DIM {
+                continue;
+            }
+            placements.push(AtlasPlacement {
+                index,
+                atlas_x: row_x,
+                atlas_y: row_y,
+            });
+            row_x += bw;
+            row_h = row_h.max(bh);
+            atlas_width = atlas_width.max(row_x);
+            atlas_height = atlas_height.max(row_y + row_h);
+        }
+        if atlas_width == 0 || atlas_height == 0 {
+            return Ok(());
+        }
+
+        let mut pixels = vec![0u8; atlas_width * atlas_height];
+        for placement in &placements {
+            let bitmap = &bitmaps[placement.index];
+            let bw = bitmap.placement.width as usize;
+            let bh = bitmap.placement.height as usize;
             for row in 0..bh {
                 let src = row * bitmap.stride;
-                let dst = row * atlas_width + cursor_x;
+                let dst = (placement.atlas_y + row) * atlas_width + placement.atlas_x;
                 pixels[dst..dst + bw].copy_from_slice(&bitmap.alpha[src..src + bw]);
             }
-            placements.push((index, cursor_x));
-            cursor_x += bw;
         }
 
         let texture = {
@@ -2030,19 +2051,32 @@ impl D3d11Renderer {
             )?
         };
         self.stats.overlay_alpha_atlas_uploads += 1;
-        for (index, atlas_x) in placements {
-            let bitmap = &bitmaps[index];
+        let aw = atlas_width as f32;
+        let ah = atlas_height as f32;
+        for placement in &placements {
+            let bitmap = &bitmaps[placement.index];
+            let color = AssColor::from_libass_rgba(bitmap.color_rgba);
             draws.push(D3d11OverlayDraw {
                 texture: texture.clone(),
-                constants: OverlayUniforms::alpha_atlas(
-                    bitmap.color_rgba,
-                    bitmap.placement.x,
-                    bitmap.placement.y,
-                    bitmap.placement.width,
-                    bitmap.placement.height,
-                    atlas_x as u32,
-                    atlas_width as u32,
-                    atlas_height as u32,
+                constants: OverlayUniforms::alpha_atlas_rect(
+                    [
+                        f32::from(color.red) / 255.0,
+                        f32::from(color.green) / 255.0,
+                        f32::from(color.blue) / 255.0,
+                        f32::from(color.alpha) / 255.0,
+                    ],
+                    [
+                        bitmap.placement.x as f32,
+                        bitmap.placement.y as f32,
+                        bitmap.placement.width as f32,
+                        bitmap.placement.height as f32,
+                    ],
+                    [
+                        placement.atlas_x as f32 / aw,
+                        placement.atlas_y as f32 / ah,
+                        bitmap.placement.width as f32 / aw,
+                        bitmap.placement.height as f32 / ah,
+                    ],
                     viewport_w,
                     viewport_h,
                     target,

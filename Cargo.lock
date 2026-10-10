@@ -351,6 +351,7 @@ version = "0.0.1"
 dependencies = [
  "ab_glyph",
  "aho-corasick",
+ "ash",
  "bytemuck",
  "coreaudio-rs",
  "crossbeam-channel",

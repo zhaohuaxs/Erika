@@ -1303,7 +1303,16 @@ fn build_renderer(
             {
                 Ok(Box::new(MetalRenderer::with_config(metal_config)?))
             }
-            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            #[cfg(target_os = "windows")]
+            {
+                build_d3d11_renderer().or_else(|e| {
+                    crate::trace::diagnostic(format!(
+                        "D3D11 renderer unavailable, falling back to wgpu: {e}"
+                    ));
+                    build_wgpu_renderer(wgpu_config)
+                })
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "windows")))]
             {
                 build_wgpu_renderer(wgpu_config)
             }
@@ -1313,6 +1322,11 @@ fn build_renderer(
             "Flutter texture backend is not supported by the presenter runtime".to_string(),
         )),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn build_d3d11_renderer() -> Result<Box<dyn RendererBackend>> {
+    Ok(Box::new(crate::renderer::d3d11::D3d11Renderer::new()?))
 }
 
 fn build_audio_output(config: PresenterAudioConfig) -> Box<dyn AudioOutputBackend> {
