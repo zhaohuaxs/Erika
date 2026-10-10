@@ -140,11 +140,27 @@ impl MetalRendererImpl {
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| PlayerError::Renderer("newCommandQueue returned nil".to_string()))?;
+        let output_mode = match config.output_mode {
+            crate::renderer::output::OutputMode::Sdr => MetalOutputMode::Sdr,
+            crate::renderer::output::OutputMode::AppleEdr { headroom } => {
+                MetalOutputMode::apple_edr(headroom)
+            }
+            crate::renderer::output::OutputMode::ExtendedLinear { headroom } => {
+                MetalOutputMode::apple_edr(headroom)
+            }
+            crate::renderer::output::OutputMode::Auto { headroom } => {
+                if headroom > 1.0 {
+                    MetalOutputMode::apple_edr(headroom)
+                } else {
+                    MetalOutputMode::Sdr
+                }
+            }
+        };
         Ok(Self {
             device,
             queue,
-            output_mode: config.output_mode,
-            drawable_pixel_format: config.output_mode.pixel_format(),
+            output_mode,
+            drawable_pixel_format: output_mode.pixel_format(),
             layer: None,
             texture_cache: None,
             video_pipeline: None,

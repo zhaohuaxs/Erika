@@ -2775,12 +2775,14 @@ impl RendererBackend for WgpuRenderer {
         Ok(())
     }
 
-    fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
+    fn resize_surface(&mut self, metrics: crate::core::SurfaceMetrics) -> Result<()> {
         if self.surface.is_none() {
             return Err(PlayerError::Renderer(
                 "no wgpu surface attached".to_string(),
             ));
         }
+        let (width, height) = metrics.physical_size();
+        let scale = metrics.content_scale;
         let (surface_width, surface_height) = scaled_surface_size(width, height, scale);
         self.configure_surface(surface_width, surface_height);
         self.overlay_alpha_atlas_cache = None;
@@ -2788,6 +2790,7 @@ impl RendererBackend for WgpuRenderer {
             attached.handle.width = width;
             attached.handle.height = height;
             attached.handle.scale = scale;
+            attached.handle.metrics = metrics;
         }
         Ok(())
     }
@@ -2818,7 +2821,9 @@ impl RendererBackend for WgpuRenderer {
                 .map_err(|e| PlayerError::Renderer(format!("hwframe transfer failed: {e}")))?;
             &sw_frame
         } else {
-            &frame.frame
+            frame.frame.decoded_frame().ok_or_else(|| {
+                PlayerError::Renderer("non-decoded frame without hw context".to_string())
+            })?
         };
 
         let planar = frame_ref.to_planar_frame().ok_or_else(|| {
@@ -2932,7 +2937,26 @@ impl RendererBackend for WgpuRenderer {
             last_danmaku_encode_duration: Default::default(),
             last_danmaku_vertex_bytes: 0,
             last_danmaku_vertex_count: 0,
+            upscaler_mode: crate::renderer::pipeline::LumaUpscalerMode::Off,
+            upscaler_backend: crate::core::LumaUpscalerBackendStatus::Off,
+            upscaler_fallbacks: 0,
+            upscaled_frames: 0,
+            last_upscaler_encode_duration: Default::default(),
+            last_gpu_duration: Default::default(),
             attached: stats.attached,
+            software_video_frames: 0,
+            hardware_video_frames: 0,
+            zero_copy_video_frames: 0,
+            direct_zero_copy_video_frames: 0,
+            shared_handle_video_frames: 0,
+            cpu_video_frame_fallbacks: 0,
+            hdr_source_frames: 0,
+            hdr10_output_frames: 0,
+            sdr_tonemap_frames: 0,
+            hdr10_metadata_updates: 0,
+            hdr10_metadata_failures: 0,
+            hdr10_output_failures: 0,
+            hdr10_output_active: false,
         }
     }
 }

@@ -1024,6 +1024,35 @@ impl DanmakuGlyphAtlas {
     pub fn required_len(&self) -> usize {
         self.stride.saturating_mul(self.height as usize)
     }
+
+    pub fn incremental_update_from(
+        &self,
+        previous_version: u64,
+        previous_width: u32,
+        previous_height: u32,
+        _previous_stride: usize,
+    ) -> Option<DanmakuAtlasUpdate> {
+        if self.version == previous_version
+            && self.width == previous_width
+            && self.height == previous_height
+        {
+            return None;
+        }
+        Some(DanmakuAtlasUpdate {
+            x: 0,
+            y: 0,
+            width: self.width,
+            height: self.height,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DanmakuAtlasUpdate {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

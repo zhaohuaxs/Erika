@@ -44,3 +44,6 @@ pub(crate) fn env_flag(name: &str) -> bool {
         Some(_) => true,
     }
 }
+pub(crate) fn diagnostic(line: impl AsRef<str>) {
+    eprintln!("{}", line.as_ref());
+}

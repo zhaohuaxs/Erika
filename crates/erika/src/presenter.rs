@@ -465,7 +465,8 @@ impl PresenterRuntime {
         self.current_danmaku = None;
         self.current_danmaku_viewport = None;
         self.last_audio_clock_sync = None;
-        self.renderer.resize_surface(width, height, scale)
+        let metrics = crate::core::SurfaceMetrics::new(width, height, scale);
+        self.renderer.resize_surface(metrics)
     }
 
     pub fn open(&mut self, media: MediaRequest) -> Result<()> {

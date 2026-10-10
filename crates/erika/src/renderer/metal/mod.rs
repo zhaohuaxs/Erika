@@ -48,15 +48,46 @@ pub struct MetalRenderer {
     current_generation: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoAlphaMode {
+    #[default]
+    Opaque = 0,
+    PackedAlphaRight = 1,
+}
+
+impl VideoAlphaMode {
+    pub fn from_raw(value: i32) -> Self {
+        match value {
+            1 => Self::PackedAlphaRight,
+            _ => Self::Opaque,
+        }
+    }
+
+    pub fn has_alpha(self) -> bool {
+        matches!(self, Self::PackedAlphaRight)
+    }
+
+    pub fn logical_width(self, encoded_width: u32) -> u32 {
+        match self {
+            Self::Opaque => encoded_width,
+            Self::PackedAlphaRight => (encoded_width / 2).max(1),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MetalRendererConfig {
-    pub output_mode: MetalOutputMode,
+    pub output_mode: crate::renderer::output::OutputMode,
+    pub video_alpha_mode: VideoAlphaMode,
+    pub luma_upscaler: crate::renderer::pipeline::LumaUpscalerMode,
 }
 
 impl Default for MetalRendererConfig {
     fn default() -> Self {
         Self {
-            output_mode: MetalOutputMode::default(),
+            output_mode: crate::renderer::output::OutputMode::default(),
+            video_alpha_mode: VideoAlphaMode::default(),
+            luma_upscaler: crate::renderer::pipeline::LumaUpscalerMode::default(),
         }
     }
 }
@@ -595,14 +626,15 @@ impl RendererBackend for MetalRenderer {
         Ok(())
     }
 
-    fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()> {
+    fn resize_surface(&mut self, metrics: crate::core::SurfaceMetrics) -> Result<()> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            self.inner.resize_surface(width, height, scale);
+            let (width, height) = metrics.physical_size();
+            self.inner.resize_surface(width, height, metrics.content_scale);
         }
         #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
-            let _ = (width, height, scale);
+            let _ = metrics;
         }
         Ok(())
     }
@@ -624,7 +656,10 @@ impl RendererBackend for MetalRenderer {
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
-            let imported = self.import_player_frame(&frame.frame)?;
+            let decoded = frame.frame.decoded_frame().ok_or_else(|| {
+                PlayerError::Renderer("Metal renderer requires a decoded frame".to_string())
+            })?;
+            let imported = self.import_player_frame(decoded)?;
             self.current_frame = Some(imported);
             self.current_media_time = frame.pts.unwrap_or(frame.media_time);
             self.current_generation = frame.generation.max(1);
@@ -685,7 +720,26 @@ impl RendererBackend for MetalRenderer {
             last_danmaku_encode_duration: stats.last_danmaku_encode_duration,
             last_danmaku_vertex_bytes: stats.last_danmaku_vertex_bytes,
             last_danmaku_vertex_count: stats.last_danmaku_vertex_count,
+            upscaler_mode: crate::renderer::pipeline::LumaUpscalerMode::default(),
+            upscaler_backend: crate::core::LumaUpscalerBackendStatus::default(),
+            upscaler_fallbacks: 0,
+            upscaled_frames: 0,
+            last_upscaler_encode_duration: Duration::ZERO,
+            last_gpu_duration: Duration::ZERO,
             attached: stats.drawable_width > 0 && stats.drawable_height > 0,
+            software_video_frames: 0,
+            hardware_video_frames: 0,
+            zero_copy_video_frames: 0,
+            direct_zero_copy_video_frames: 0,
+            shared_handle_video_frames: 0,
+            cpu_video_frame_fallbacks: 0,
+            hdr_source_frames: 0,
+            hdr10_output_frames: 0,
+            sdr_tonemap_frames: 0,
+            hdr10_metadata_updates: 0,
+            hdr10_metadata_failures: 0,
+            hdr10_output_failures: 0,
+            hdr10_output_active: false,
         }
     }
 }

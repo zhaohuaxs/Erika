@@ -522,6 +522,20 @@ pub enum DecoderBackend {
     Dxva2,
 }
 
+impl DecoderBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Software => "software",
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            Self::VideoToolbox => "videotoolbox",
+            #[cfg(target_os = "windows")]
+            Self::D3d11va => "d3d11va",
+            #[cfg(target_os = "windows")]
+            Self::Dxva2 => "dxva2",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecoderConfig {
     pub backend: DecoderBackend,
@@ -839,6 +853,33 @@ impl VideoToolboxPixelBuffer<'_> {
 
 unsafe impl Send for Frame {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct D3d11vaTexture<'a> {
+    raw_texture: *mut c_void,
+    array_index: u32,
+    width: u32,
+    height: u32,
+    _frame: PhantomData<&'a Frame>,
+}
+
+impl D3d11vaTexture<'_> {
+    pub fn raw_texture(self) -> *mut c_void {
+        self.raw_texture
+    }
+
+    pub fn array_index(self) -> u32 {
+        self.array_index
+    }
+
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    pub fn height(self) -> u32 {
+        self.height
+    }
+}
+
 impl Frame {
     fn alloc(time_base: TimeBase) -> Result<Self> {
         let ptr = unsafe { sys::av_frame_alloc() };
@@ -892,16 +933,28 @@ impl Frame {
         unsafe { (*self.ptr).format }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn is_videotoolbox(&self) -> bool {
-        self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            self.raw_pixel_format() == sys::AVPixelFormat_AV_PIX_FMT_VIDEOTOOLBOX
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            false
+        }
     }
 
-    #[cfg(target_os = "windows")]
     pub fn is_d3d11va(&self) -> bool {
-        let fmt = self.raw_pixel_format();
-        fmt == sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD
-            || fmt == 171 // AV_PIX_FMT_D3D11
+        #[cfg(target_os = "windows")]
+        {
+            let fmt = self.raw_pixel_format();
+            fmt == sys::AVPixelFormat_AV_PIX_FMT_D3D11VA_VLD
+                || fmt == 171 // AV_PIX_FMT_D3D11
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
     }
 
     pub fn decode_backend(&self) -> DecoderBackend {
@@ -990,6 +1043,44 @@ impl Frame {
 
     pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
         unsafe { frame_hdr_metadata(self.ptr) }
+    }
+
+    pub fn dovi_metadata(&self) -> Option<crate::renderer::pipeline::DoviSourceMetadata> {
+        None
+    }
+
+    pub fn try_clone_ref(&self) -> Result<Self> {
+        let frame = Frame::alloc(self.time_base)?;
+        check(
+            unsafe { sys::av_frame_ref(frame.ptr, self.ptr) },
+            "av_frame_ref",
+        )?;
+        Ok(frame)
+    }
+
+    pub fn line_sizes(&self) -> [i32; 4] {
+        unsafe {
+            let linesize = (*self.ptr).linesize;
+            [linesize[0], linesize[1], linesize[2], linesize[3]]
+        }
+    }
+
+    pub fn d3d11va_texture(&self) -> Option<D3d11vaTexture<'_>> {
+        if !self.is_d3d11va() {
+            return None;
+        }
+        let raw_texture = unsafe { (*self.ptr).data[0] }.cast::<c_void>();
+        if raw_texture.is_null() {
+            return None;
+        }
+        let array_index = unsafe { (*self.ptr).data[1] as usize }.try_into().ok()?;
+        Some(D3d11vaTexture {
+            raw_texture,
+            array_index,
+            width: self.width(),
+            height: self.height(),
+            _frame: PhantomData,
+        })
     }
 
     pub fn transfer_to_system_memory(&self) -> Result<Frame> {

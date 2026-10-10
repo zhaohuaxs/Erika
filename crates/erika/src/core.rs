@@ -9,7 +9,7 @@ use thiserror::Error;
 
 use crate::audio::AudioClockSnapshot;
 use crate::danmaku::DanmakuRenderPlan;
-use crate::ffmpeg::{Frame, PcmAudioFrame};
+use crate::ffmpeg::PcmAudioFrame;
 use crate::overlay::OverlayFrame;
 use crate::playback::{PlaybackRunState, PlaybackSessionConfig, VideoPlaybackEngine};
 use crate::subtitle::{DecodedSubtitleFrame, SubtitleTrackConfig};
@@ -230,11 +230,13 @@ pub enum PlayerEvent {
 }
 
 pub struct PlayerVideoFrame {
-    pub frame: Frame,
+    pub frame: crate::renderer::VideoFramePayload,
+    pub decode_backend: crate::ffmpeg::DecoderBackend,
     pub pts: Option<Duration>,
     pub media_time: Duration,
     pub late_by: Option<Duration>,
     pub generation: u64,
+    pub scene_avg_nits: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -291,11 +293,82 @@ impl<'a> RenderFrameContext<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SurfacePhysicalExtent {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl SurfacePhysicalExtent {
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            width: width.max(1),
+            height: height.max(1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceMetrics {
+    pub physical_extent: SurfacePhysicalExtent,
+    pub content_scale: f64,
+}
+
+impl SurfaceMetrics {
+    pub fn new(width: u32, height: u32, content_scale: f64) -> Self {
+        Self {
+            physical_extent: SurfacePhysicalExtent::new(width, height),
+            content_scale: normalize_surface_scale(content_scale),
+        }
+    }
+
+    pub fn physical_size(self) -> (u32, u32) {
+        (self.physical_extent.width, self.physical_extent.height)
+    }
+}
+
+fn normalize_surface_scale(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SurfaceOutputCapabilities {
+    pub extended_linear: bool,
+    pub direct_composition: bool,
+    pub desired_headroom: f32,
+    pub fallback_reason: crate::renderer::output::OutputFallbackReason,
+}
+
+impl Default for SurfaceOutputCapabilities {
+    fn default() -> Self {
+        Self {
+            extended_linear: false,
+            direct_composition: false,
+            desired_headroom: 0.0,
+            fallback_reason: crate::renderer::output::OutputFallbackReason::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PlatformSurface {
     Metal(MetalSurfaceHandle),
     Wgpu(WgpuSurfaceHandle),
     FlutterTexture(FlutterTextureHandle),
+}
+
+impl PlatformSurface {
+    pub fn metrics(self) -> SurfaceMetrics {
+        match self {
+            Self::Metal(handle) => handle.metrics,
+            Self::Wgpu(handle) => handle.metrics,
+            Self::FlutterTexture(handle) => handle.metrics,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -304,6 +377,7 @@ pub struct MetalSurfaceHandle {
     pub width: u32,
     pub height: u32,
     pub scale: f64,
+    pub metrics: SurfaceMetrics,
 }
 
 impl MetalSurfaceHandle {
@@ -313,6 +387,7 @@ impl MetalSurfaceHandle {
             width,
             height,
             scale,
+            metrics: SurfaceMetrics::new(width, height, scale),
         }
     }
 }
@@ -337,6 +412,8 @@ pub struct WgpuSurfaceHandle {
     pub width: u32,
     pub height: u32,
     pub scale: f64,
+    pub metrics: SurfaceMetrics,
+    pub output_capabilities: SurfaceOutputCapabilities,
 }
 
 impl WgpuSurfaceHandle {
@@ -355,6 +432,8 @@ impl WgpuSurfaceHandle {
             width,
             height,
             scale,
+            metrics: SurfaceMetrics::new(width, height, scale),
+            output_capabilities: SurfaceOutputCapabilities::default(),
         }
     }
 }
@@ -377,6 +456,7 @@ pub struct FlutterTextureHandle {
     pub height: u32,
     pub scale: f64,
     pub hdr_capable: bool,
+    pub metrics: SurfaceMetrics,
 }
 
 impl FlutterTextureHandle {
@@ -394,6 +474,7 @@ impl FlutterTextureHandle {
             height,
             scale,
             hdr_capable: false,
+            metrics: SurfaceMetrics::new(width, height, scale),
         }
     }
 }
@@ -401,22 +482,112 @@ impl FlutterTextureHandle {
 pub trait RendererBackend {
     fn attach_surface(&mut self, surface: PlatformSurface) -> Result<()>;
     fn detach_surface(&mut self) -> Result<()>;
-    fn resize_surface(&mut self, width: u32, height: u32, scale: f64) -> Result<()>;
+    fn resize_surface(&mut self, metrics: SurfaceMetrics) -> Result<()>;
     fn render_test_frame(&mut self, time_seconds: f64) -> Result<()>;
 
-    /// Import/upload a freshly decoded video frame and retain it as the current
-    /// frame to display. The backend owns the imported representation (Metal
-    /// textures, wgpu textures, ...) so the presenter stays backend-agnostic.
     fn upload_player_frame(&mut self, frame: &PlayerVideoFrame) -> Result<()>;
 
-    /// Render the current frame (optionally compositing `overlay`) to the attached
-    /// surface. Returns `false` if there is no current frame to draw, letting the
-    /// caller fall back to a test frame.
+    fn clear_current_frame(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn preserve_current_frame_for_transition(&mut self) -> Result<()> {
+        self.clear_current_frame()
+    }
+
+    fn preserve_current_frame_for_track_transition(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     fn render_current_frame(&mut self, context: RenderFrameContext<'_>) -> Result<bool>;
+
+    fn set_flutter_texture_buffer(
+        &mut self,
+        _raw_texture: u64,
+        _width: u32,
+        _height: u32,
+    ) -> Result<()> {
+        Err(PlayerError::Renderer(
+            "external Flutter texture buffers are not supported by this renderer".to_string(),
+        ))
+    }
+
+    fn capture_current_frame(
+        &mut self,
+        _context: RenderFrameContext<'_>,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Option<RendererFrameCapture>> {
+        Ok(None)
+    }
 
     fn runtime_stats(&self) -> RendererRuntimeStats {
         RendererRuntimeStats::default()
     }
+
+    fn take_flutter_frame(&mut self) -> Option<RendererFrameCapture> {
+        None
+    }
+
+    fn resource_stats(&self) -> RendererResourceStats {
+        RendererResourceStats::default()
+    }
+
+    fn output_status(&self) -> crate::renderer::output::OutputRuntimeStatus {
+        crate::renderer::output::OutputRuntimeStatus::default()
+    }
+
+    fn supports_mediacodec_surface_frames(&self) -> bool {
+        false
+    }
+
+    fn set_luma_upscaler(&mut self, _mode: crate::renderer::pipeline::LumaUpscalerMode) {}
+
+    fn set_output_headroom(&mut self, _headroom: f32, _known: bool) {}
+
+    fn composition_swapchain_ptr(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    fn composition_swapchain_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+
+    fn windows_flutter_texture_iunknown(&self) -> Option<*mut std::ffi::c_void> {
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RendererFrameCapture {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LumaUpscalerBackendStatus {
+    #[default]
+    Off,
+    Inactive,
+    Building,
+    Scalar,
+    SimdgroupMatrix,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RendererResourceStats {
+    pub device_current_allocated_bytes: u64,
+    pub device_recommended_working_set_bytes: u64,
+    pub drawable_estimated_bytes: u64,
+    pub video_frame_bytes: u64,
+    pub overlay_atlas_bytes: u64,
+    pub danmaku_atlas_bytes: u64,
+    pub danmaku_vertex_buffer_bytes: u64,
+    pub upscaler_bytes: u64,
+    pub renderer_tracked_bytes: u64,
+    pub drawable_count: u32,
+    pub output_mode_switches: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -437,7 +608,26 @@ pub struct RendererRuntimeStats {
     pub last_danmaku_encode_duration: Duration,
     pub last_danmaku_vertex_bytes: usize,
     pub last_danmaku_vertex_count: usize,
+    pub upscaler_mode: crate::renderer::pipeline::LumaUpscalerMode,
+    pub upscaler_backend: LumaUpscalerBackendStatus,
+    pub upscaler_fallbacks: u64,
+    pub upscaled_frames: u64,
+    pub last_upscaler_encode_duration: Duration,
+    pub last_gpu_duration: Duration,
     pub attached: bool,
+    pub software_video_frames: u64,
+    pub hardware_video_frames: u64,
+    pub zero_copy_video_frames: u64,
+    pub direct_zero_copy_video_frames: u64,
+    pub shared_handle_video_frames: u64,
+    pub cpu_video_frame_fallbacks: u64,
+    pub hdr_source_frames: u64,
+    pub hdr10_output_frames: u64,
+    pub sdr_tonemap_frames: u64,
+    pub hdr10_metadata_updates: u64,
+    pub hdr10_metadata_failures: u64,
+    pub hdr10_output_failures: u64,
+    pub hdr10_output_active: bool,
 }
 
 struct PlayerInner {
@@ -895,16 +1085,28 @@ fn run_playback_worker(
             Ok(Some(frame)) => {
                 let position = frame.pts.unwrap_or(frame.media_time);
                 last_position_event = Some(position);
-                emit_video_frame_from_worker(
-                    &inner,
-                    PlayerVideoFrame {
-                        frame: frame.frame,
-                        pts: frame.pts,
-                        media_time: frame.media_time,
-                        late_by: frame.late_by,
-                        generation: playback_generation,
-                    },
-                );
+                match crate::renderer::VideoFramePayload::from_decoded(frame.frame) {
+                    Ok(payload) => {
+                        emit_video_frame_from_worker(
+                            &inner,
+                            PlayerVideoFrame {
+                                frame: payload,
+                                decode_backend: crate::ffmpeg::DecoderBackend::Software,
+                                pts: frame.pts,
+                                media_time: frame.media_time,
+                                late_by: frame.late_by,
+                                generation: playback_generation,
+                                scene_avg_nits: None,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        emit_from_worker(
+                            &inner,
+                            PlayerEvent::Error(PlayerError::Playback(error.to_string())),
+                        );
+                    }
+                }
             }
             Ok(None) => {}
             Err(error) => {

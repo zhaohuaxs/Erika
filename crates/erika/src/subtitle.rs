@@ -227,6 +227,12 @@ pub struct SubtitleBitmapPlane {
     pub rgba: Vec<u8>,
 }
 
+impl SubtitleBitmapPlane {
+    pub fn scaled_rect(&self, _viewport_width: u32, _viewport_height: u32) -> (i32, i32, u32, u32) {
+        (self.x, self.y, self.width, self.height)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubtitleBitmapPlacement {
     pub x: i32,
