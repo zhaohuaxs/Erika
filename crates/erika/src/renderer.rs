@@ -1,3 +1,5 @@
+#[cfg(all(feature = "wgpu", target_os = "android"))]
+pub(crate) mod android_vulkan;
 #[doc(hidden)]
 pub mod artcnn;
 #[cfg(target_os = "windows")]

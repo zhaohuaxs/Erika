@@ -2,6 +2,9 @@ use std::ffi::{CStr, CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
+#[cfg(target_os = "android")]
+mod android_jni;
+
 use crossbeam_channel::Receiver;
 use erika::danmaku::{
     DanmakuLayoutConfig, DanmakuShadowStyle, DanmakuTimeline, DanmakuTrackInfo, DanmakuTrackSource,
